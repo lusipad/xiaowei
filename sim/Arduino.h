@@ -48,6 +48,7 @@ inline int analogRead(int) { return 42; }
 #define A0 0
 #define LED_LED 109
 #define LED_BUILTIN LED_LED
+#define LCD_BACKLIGHT 110
 
 inline int digitalRead(int pin) { return sim::digitalReadImpl(pin); }
 inline void tone(int, int, int) {}
@@ -62,31 +63,58 @@ inline long random(long hi) { return sim::simRandom(0, hi); }
 #define pgm_read_byte(p) (*(const unsigned char*)(p))
 #define F(x) (x)
 
-// ---- String(够 pet/WioKitCjk 使用的最小子集) ----
+// ---- String(够 pet/WioKit 使用的子集) ----
 class String {
  public:
   String() {}
   String(const char* p) : s_(p ? p : "") {}
   explicit String(char c) : s_(1, c) {}
-  bool operator==(const char* p) const { return s_ == p; }
-  bool operator!=(const char* p) const { return s_ != p; }
+  explicit String(int v) : s_(std::to_string(v)) {}
+  explicit String(unsigned int v) : s_(std::to_string(v)) {}
+  explicit String(long v) : s_(std::to_string(v)) {}
+  explicit String(unsigned long v) : s_(std::to_string(v)) {}
+  bool operator==(const char* p) const { return s_ == (p ? p : ""); }
+  bool operator!=(const char* p) const { return s_ != (p ? p : ""); }
+  bool operator==(const String& o) const { return s_ == o.s_; }
+  bool operator!=(const String& o) const { return s_ != o.s_; }
   const char* c_str() const { return s_.c_str(); }
   unsigned length() const { return (unsigned)s_.size(); }
   char charAt(unsigned i) const { return s_[i]; }
   char operator[](unsigned i) const { return s_[i]; }
-  bool startsWith(const char* p) const { return s_.rfind(p, 0) == 0; }
+  bool startsWith(const char* p) const { return p && s_.rfind(p, 0) == 0; }
   String substring(unsigned from) const {
     return from < s_.size() ? String(s_.substr(from)) : String();
   }
-  void replace(const char*, const char*) {}
+  String substring(unsigned from, unsigned to) const {
+    if (from >= s_.size() || to <= from) return String();
+    return String(s_.substr(from, to - from));
+  }
+  void trim() {
+    size_t b = 0, e = s_.size();
+    while (b < e && (s_[b] == ' ' || s_[b] == '\t' || s_[b] == '\r' || s_[b] == '\n')) b++;
+    while (e > b && (s_[e - 1] == ' ' || s_[e - 1] == '\t' || s_[e - 1] == '\r' || s_[e - 1] == '\n')) e--;
+    s_ = s_.substr(b, e - b);
+  }
+  bool operator<(const String& o) const { return s_ < o.s_; }
+  void replace(const char* find, const char* rep) {
+    if (!find || !*find) return;
+    const std::string f(find), r(rep ? rep : "");
+    size_t pos = 0;
+    while ((pos = s_.find(f, pos)) != std::string::npos) {
+      s_.replace(pos, f.size(), r);
+      pos += r.size();
+    }
+  }
   int toInt() const { return atoi(s_.c_str()); }
   String& operator=(const char* p) { s_ = p ? p : ""; return *this; }
-  String& operator+=(const char* p) { s_ += p; return *this; }
+  String& operator+=(const char* p) { if (p) s_ += p; return *this; }
+  String& operator+=(const String& o) { s_ += o.s_; return *this; }
+  String& operator+=(char c) { s_.push_back(c); return *this; }
 
  private:
   friend String operator+(const String& a, const String& b) { return String(a.s_ + b.s_); }
-  friend String operator+(const String& a, const char* b) { return String(a.s_ + b); }
-  friend String operator+(const char* a, const String& b) { return String(std::string(a) + b.s_); }
+  friend String operator+(const String& a, const char* b) { return String(a.s_ + (b ? b : "")); }
+  friend String operator+(const char* a, const String& b) { return String(std::string(a ? a : "") + b.s_); }
   explicit String(const std::string& s) : s_(s) {}
   std::string s_;
 };
@@ -95,6 +123,9 @@ class String {
 struct SimSerial {
   void begin(unsigned long) { setvbuf(stdout, NULL, _IONBF, 0); }
   operator bool() const { return true; }
+  int available() const { return 0; }
+  int read() { return -1; }
+  void flush() {}
   void print(const char* p) { fputs(p, stdout); }
   void print(char c) { fputc(c, stdout); }
   void print(int v) { printf("%d", v); }

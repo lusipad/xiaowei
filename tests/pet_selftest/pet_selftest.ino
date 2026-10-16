@@ -31,6 +31,9 @@ void testHttp() {
   check(st("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello") == HTTP_DONE, "http: cl full");
   check(st("HTTP/1.1 200 OK\r\ncontent-length:5\r\n\r\nhello") == HTTP_DONE, "http: cl lowercase no space");
   check(st("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n") == HTTP_DONE, "http: cl zero");
+  check(st("HTTP/1.1 100 Continue\r\n\r\n") == HTTP_NEED_MORE, "http: 100 continue only");
+  check(st("HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK") == HTTP_DONE,
+        "http: 100 continue + 200 ok");
   check(st("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n") == HTTP_DONE,
         "http: chunked done");
   check(st("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n") == HTTP_NEED_MORE,
@@ -42,6 +45,13 @@ void testHttp() {
   check(httpHeaderEnd(h, strlen(h)) == 43, "http: header end pos");
   check(httpIsChunked(h, 43), "http: is chunked");
   check(!httpIsChunked("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n", 34), "http: not chunked");
+  const char* hFalse = "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\nX-Note: chunked\r\n\r\n";
+  check(!httpIsChunked(hFalse, (size_t)httpHeaderEnd(hFalse, strlen(hFalse))), "http: chunked in other header ignored");
+  check(httpStatusCode("HTTP/1.1 200 OK\r\n\r\n", 19) == 200, "http: status 200");
+  check(httpStatusCode("HTTP/1.1 401 Unauthorized\r\n\r\n", 29) == 401, "http: status 401");
+  check(httpStatusCode("HTTP/1.1 402 Payment Required\r\n\r\n", 33) == 402, "http: status 402");
+  check(httpStatusCode("HTTP/1.1 429 Too Many Requests\r\n\r\n", 34) == 429, "http: status 429");
+  check(httpStatusCode("HTTP/1.1", 8) == 0, "http: status partial");
 }
 
 void testChunked() {
@@ -51,6 +61,7 @@ void testChunked() {
   check(decodeEq("A\r\n0123456789\r\n0\r\n\r\n", "0123456789"), "chunk: hex upper");
   check(decodeEq("3;ext=1\r\nabc\r\n0\r\n\r\n", "abc"), "chunk: extension");
   check(!decodeEq("5\r\nhel", "hel"), "chunk: truncated is incomplete");
+  check(!decodeEq("FFFFFFFFFFFFFFFFF\r\nabc\r\n0\r\n\r\n", "abc"), "chunk: overflow hex rejected");
 }
 
 void emo(const char* s, int wantE, const char* wantText, const char* name) {

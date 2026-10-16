@@ -46,7 +46,7 @@ def asr(token, wav_path):
     body = {
         "format": "wav",
         "rate": 16000,
-        "dev_pid": 15372,
+        "dev_pid": 1537,  # 1537 标准普通话(15372 加强版需单独开通权限)
         "channel": 1,
         "cuid": "wio-terminal-test",
         "token": token,

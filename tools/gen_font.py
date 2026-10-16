@@ -69,17 +69,29 @@ with open(OUT_PATH, "w", newline="\n") as f:
         f.write("  " + ",".join(f"0x{b:02X}" for b in flat[i:i + 15]) + ",\n")
     f.write("};\n\n")
 
-    # 常用高频拟声与口语二级字 (补充表: 仅需 ~600B Flash)
-    EXTRA_WORDS = ['喵', '咪', '哒', '嗨', '嗷', '噜', '尴', '尬', '唔', '喽', '噢', '呗', '唷', '咚', '嗦', '叽', '嘀', '嗒']
+    # 常用高频现代汉语二级字补充表 (涵盖拟声、口语、情绪、动作、城市、美食、动植物，按 UTF-8 排序供二分查找)
+    EXTRA_CHARS_STR = (
+        "嗯咦咧啵啾唔喽噢呗唷咚嗦叽嘀嗒喵咪哒嗨嗷噜尴尬啧喔喏咻嚓哐啷淅咔哧噗嗤"
+        "聆瞰瞌盹慵惬馨潇逍璀璨斓皎朦胧冽煦嘈漪徜徉蜿岖妩窈窕珑诙腼炫飒懵愣忐忑"
+        "憧憬唠叨嘟囔哽啜嗝蜷挲偎舐腌涮炖煲焖饪瘠圳莞衢濮漯泸莓枇杷猕柚橘葚橄榄"
+        "槟淇豉噌荞蛳馍馄饨粽糍粑喱暹玳瑁豚猬貂鼯鹦鹉鹭隼鳄蜥蜴蟒蟾蜍蟆蝌蚪蝾螈"
+        "鲨鱿螃蛎蚝蜊蛞蝓蚯蚓蟥蜈蚣蜻蜓螳螂蟋蟀蝈蚱蜢虻蟑茉栀薰罂荟藓蕨榕桦楠枸"
+        "杞芪茯苓藿睑龈踝痦痣痱荨翡瑙琥珀玺曜岫嵩鄱俑滕鹳婺湄撸黏怂怼霾"
+    )
+    EXTRA_WORDS = list(dict.fromkeys(EXTRA_CHARS_STR))
     extra_entries = []
     for w in EXTRA_WORDS:
         gb = w.encode('gb2312')
         qu = gb[0] - 0xa0
         wei = gb[1] - 0xa0
+        if qu < 56:
+            continue
         u8 = w.encode('utf-8')
         off = ((qu - 1) * 94 + (wei - 1)) * 32
         glyph = data[off:off+32]
         extra_entries.append((u8, glyph, w))
+
+    extra_entries.sort(key=lambda e: e[0])
 
     f.write(f"#define HZ16_EXTRA_COUNT {len(extra_entries)}\n")
     f.write("struct Hz16ExtraGlyph {\n  uint8_t utf8[3];\n  uint8_t glyph[32];\n};\n\n")

@@ -5,6 +5,7 @@
 #include <Seeed_GFX.h>
 #include <WioKitCjk.h>
 #include "pet_scene_data.h"
+#include "pet_skin_manager.h"
 
 enum Face {
   F_NORMAL, F_BLINK, F_HAPPY, F_SAD, F_LISTEN, F_THINK,
@@ -18,7 +19,7 @@ const uint16_t C_WATER = 0x5DFF;      // 泪滴/声波
 const uint16_t C_GOLD = 0xFEA0;       // 星光/音符
 const uint16_t C_BOTTOM_BG = 0x0862;  // 底部黑框内胆颜色
 
-// 装饰层区域 (左右两侧墙壁空旷区域, 必须位于 y >= 96, 绝不能侵入气泡 y=8..92)
+// 装饰层区域 (左右两侧墙壁空旷区域, 必须位于 y >= 96, 绝不能侵入气泡 y=4..93)
 const int DECO_LX = 16, DECO_RX = 254, DECO_Y = 96, DECO_W = 46, DECO_H = 56;
 
 static int petLastLook = 0;
@@ -32,12 +33,24 @@ void restoreSceneRect(int rx, int ry, int rw, int rh) {
   if (rw <= 0 || rh <= 0) return;
 
   uint16_t line[320];
-  for (int y = ry; y < ry + rh; y++) {
-    const uint8_t* src = &PET_SCENE_BG[y * 320 + rx];
-    for (int x = 0; x < rw; x++) {
-      line[x] = PET_PALETTE[src[x]];
+  if (currentSkinId == 0 || !hasDsSkin) {
+    for (int y = ry; y < ry + rh; y++) {
+      const uint8_t* src = &PET_SCENE_BG[y * 320 + rx];
+      for (int x = 0; x < rw; x++) {
+        line[x] = PET_PALETTE[src[x]];
+      }
+      display.pushImage(rx, y, rw, 1, line);
     }
-    display.pushImage(rx, y, rw, 1, line);
+  } else {
+    uint8_t idxBuf[320];
+    const uint32_t bgBase = QSPI_SKIN1_ADDR + dsSkinHeader.bgOffset;
+    for (int y = ry; y < ry + rh; y++) {
+      petQspiRead(bgBase + y * 320 + rx, idxBuf, rw);
+      for (int x = 0; x < rw; x++) {
+        line[x] = dsPalette[idxBuf[x]];
+      }
+      display.pushImage(rx, y, rw, 1, line);
+    }
   }
 }
 
@@ -50,14 +63,29 @@ void petFaceResetLook() {
 void drawFeatures(int f, int look = 0) {
   if (f < 0 || f >= 14) f = F_NORMAL;
   (void)look;  // 兼容旧接口，面部切片固定原位，彻底杜绝切片错位撕裂与重影
-  const uint8_t* patch = PET_FACES[f];
-  uint16_t line[PET_FACE_W];
-  for (int y = 0; y < PET_FACE_H; y++) {
-    const uint8_t* src = &patch[y * PET_FACE_W];
-    for (int x = 0; x < PET_FACE_W; x++) {
-      line[x] = PET_PALETTE[src[x]];
+  if (currentSkinId == 0 || !hasDsSkin) {
+    const uint8_t* patch = PET_FACES[f];
+    uint16_t line[PET_FACE_W];
+    for (int y = 0; y < PET_FACE_H; y++) {
+      const uint8_t* src = &patch[y * PET_FACE_W];
+      for (int x = 0; x < PET_FACE_W; x++) {
+        line[x] = PET_PALETTE[src[x]];
+      }
+      display.pushImage(PET_FACE_X, PET_FACE_Y + y, PET_FACE_W, 1, line);
     }
-    display.pushImage(PET_FACE_X, PET_FACE_Y + y, PET_FACE_W, 1, line);
+  } else {
+    const int fw = dsSkinHeader.faceW;
+    const int fh = dsSkinHeader.faceH;
+    const uint32_t faceBase = QSPI_SKIN1_ADDR + dsSkinHeader.facesOffset + (uint32_t)f * dsSkinHeader.faceSize;
+    uint8_t faceLineIdx[86];
+    uint16_t line[86];
+    for (int y = 0; y < fh; y++) {
+      petQspiRead(faceBase + y * fw, faceLineIdx, fw);
+      for (int x = 0; x < fw; x++) {
+        line[x] = dsPalette[faceLineIdx[x]];
+      }
+      display.pushImage(dsSkinHeader.faceX, dsSkinHeader.faceY + y, fw, 1, line);
+    }
   }
 }
 
@@ -69,15 +97,14 @@ void drawEyesOnly(int f, int look = 0) {
 // 整屏绘制: 绘制概念图基础场景 + 应用指定表情 (仅在切换状态时调用)
 void drawPet(int f) {
   petLastLook = 0;
-  uint16_t line[320];
-  for (int y = 0; y < 240; y++) {
-    const uint8_t* src = &PET_SCENE_BG[y * 320];
-    for (int x = 0; x < 320; x++) {
-      line[x] = PET_PALETTE[src[x]];
-    }
-    display.pushImage(0, y, 320, 1, line);
+  restoreSceneRect(0, 0, 320, 240);
+  if (currentSkinId == 1 && hasDsSkin) {
+    const uint16_t bg = petSkinGetBottomBg();
+    display.fillRoundRect(6, 208, 308, 29, 4, bg);
+    display.drawRoundRect(6, 208, 308, 29, 4, 0x0000);
+    display.drawRoundRect(7, 209, 306, 27, 3, 0x4478);
   }
-  if (f != F_NORMAL) {
+  if (f != F_NORMAL || currentSkinId != 0) {
     drawFeatures(f, 0);
   }
 }
@@ -181,25 +208,81 @@ void drawBubbleFrame(int x, int y, int w, int h) {
   display.drawPixel(x + w - 3, y + h - 2, C_EDGE);
   display.drawPixel(x + w - 2, y + h - 3, C_EDGE);
 
-  // 气泡尾巴 (指向猫咪额头中心 160, y+h+8)
+  // 气泡尾巴 (指向猫咪额头中心 160, 尖端严格落在 y+h+6 <= 93, 绝不侵入 PET_FACE_Y=94 面部切片区!)
   const int tx = 160, ty = y + h - 1;
-  display.fillTriangle(tx - 7, ty, tx + 7, ty, tx, ty + 8, C_BUBBLE);
-  display.drawLine(tx - 8, ty, tx, ty + 8, C_EDGE);
-  display.drawLine(tx + 8, ty, tx, ty + 8, C_EDGE);
-  display.drawFastHLine(tx - 7, ty, 15, C_BUBBLE);  // 抹平气泡底部与尾巴连接处的线
+  display.fillTriangle(tx - 7, ty, tx + 7, ty, tx, ty + 7, C_BUBBLE);
+  display.drawLine(tx - 7, ty, tx, ty + 7, C_EDGE);
+  display.drawLine(tx + 7, ty, tx, ty + 7, C_EDGE);
+  display.drawFastHLine(tx - 6, ty, 13, C_BUBBLE);  // 抹平气泡底部与尾巴连接处的线
+}
+
+// 按最大视觉宽度(像素)安全截断 UTF-8 字符串，防止长文本冲破气泡底边
+static String fitBubbleText(const String& s, int maxLines, int linePx = 264) {
+  const uint8_t* p = (const uint8_t*)s.c_str();
+  int curLine = 1;
+  int cx = 0;
+  size_t pos = 0;
+  while (p[pos]) {
+    if (p[pos] == '\n') {
+      if (curLine >= maxLines) break;
+      curLine++;
+      cx = 0;
+      pos++;
+      continue;
+    }
+    int charW = 8;
+    size_t step = 1;
+    if (p[pos] >= 0xF0) {
+      while (step < 4 && p[pos + step] != 0 && (p[pos + step] & 0xC0) == 0x80) step++;
+      charW = 0;
+    } else if (p[pos] >= 0xE0) {
+      if ((p[pos + 1] & 0xC0) == 0x80 && (p[pos + 2] & 0xC0) == 0x80) step = 3;
+      charW = 16;
+    } else if (p[pos] >= 0xC0) {
+      if ((p[pos + 1] & 0xC0) == 0x80) step = 2;
+      charW = 16;
+    } else {
+      charW = 8;
+    }
+    if (cx + charW > linePx) {
+      if (curLine >= maxLines) break;
+      curLine++;
+      cx = 0;
+    }
+    cx += charW;
+    pos += step;
+  }
+  if (!p[pos]) return s;
+  String out = "";
+  for (size_t i = 0; i < pos; i++) out += (char)p[i];
+  return out;
 }
 
 void drawBubbleText(const String& t1, uint16_t c1, const String& t2, uint16_t c2) {
-  // 气泡覆盖 y=8..92, x=14..306, 尾巴指向 y=100
-  drawBubbleFrame(14, 8, 292, 84);
-  const int y = drawTextCJK(t1, 26, 16, 290, c1, C_BUBBLE);
-  if (t2.length()) {
-    if (y < 46) {
-      display.drawFastHLine(26, 42, 268, 0xD6B8);
-      drawTextCJK(t2, 26, 48, 290, c2, C_BUBBLE);
+  // 气泡主体 y=4..86 (h=83), 尾巴尖端 ty+7 = 86+7 = 93 (刚好在 PET_FACE_Y=94 上方 1px, 永不被 drawFeatures 截断!)
+  drawBubbleFrame(14, 4, 292, 83);
+  if (!t2.length()) {
+    const String safe1 = fitBubbleText(t1, 4);
+    drawTextCJK(safe1, 26, 12, 290, c1, C_BUBBLE);
+    return;
+  }
+  // 当 t2 较长(>2行, >96字节)时采用紧凑排布, 容纳 1行问题 + 3行回答 且不溢出底边(y=86)
+  if (t2.length() > 96) {
+    const String safe1 = fitBubbleText(t1, 1);
+    drawTextCJK(safe1, 26, 8, 290, c1, C_BUBBLE);
+    display.drawFastHLine(26, 26, 268, 0xD6B8);
+    const String safe2 = fitBubbleText(t2, 3);
+    drawTextCJK(safe2, 26, 29, 290, c2, C_BUBBLE);
+  } else {
+    const String safe1 = fitBubbleText(t1, 2);
+    const int y = drawTextCJK(safe1, 26, 12, 290, c1, C_BUBBLE);
+    if (y < 42) {
+      display.drawFastHLine(26, 38, 268, 0xD6B8);
+      const String safe2 = fitBubbleText(t2, 2);
+      drawTextCJK(safe2, 26, 44, 290, c2, C_BUBBLE);
     } else {
-      drawTextCJK(t2, 26, y + 2, 290, c2, C_BUBBLE);
+      const String safe2 = fitBubbleText(t2, 1);
+      drawTextCJK(safe2, 26, y + 2, 290, c2, C_BUBBLE);
     }
   }
 }
-

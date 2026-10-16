@@ -7,10 +7,14 @@ Usage:
 """
 
 import sys
+import shutil
 import subprocess
 import argparse
 import time
+from pathlib import Path
 from test_harness import find_wio_port, WioHarnessClient, run_tests
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def run_cmd(cmd, desc):
@@ -37,12 +41,14 @@ def main():
         print("[ERROR] Wio Terminal not detected on serial port.")
         sys.exit(1)
 
-    arduino_cli = "C:\\Program Files\\Arduino CLI\\arduino-cli.exe"
+    arduino_cli = shutil.which("arduino-cli") or "C:\\Program Files\\Arduino CLI\\arduino-cli.exe"
+    libs_dir = REPO_ROOT / "libraries"
+    pet_dir = REPO_ROOT / "pet"
 
     if args.flash:
         # Step 1: Compile
         run_cmd(
-            f'"{arduino_cli}" compile --libraries "d:\\Repos\\seeed-terminal\\libraries" --fqbn Seeeduino:samd:seeed_wio_terminal "d:\\Repos\\seeed-terminal\\pet"',
+            f'"{arduino_cli}" compile --libraries "{libs_dir}" --fqbn Seeeduino:samd:seeed_wio_terminal "{pet_dir}"',
             "Compiling pet firmware"
         )
 
@@ -50,7 +56,7 @@ def main():
         if not port:
             port = find_wio_port() or "COM3"
         run_cmd(
-            f'"{arduino_cli}" upload -p {port} --fqbn Seeeduino:samd:seeed_wio_terminal "d:\\Repos\\seeed-terminal\\pet"',
+            f'"{arduino_cli}" upload -p {port} --fqbn Seeeduino:samd:seeed_wio_terminal "{pet_dir}"',
             f"Flashing firmware to {port}"
         )
 

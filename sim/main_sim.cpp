@@ -1,9 +1,9 @@
 // 小维模拟器入口:把真实的 pet.ino(状态机)+ pet_face/pet_anim(表情动画)+ WioKitCjk(汉字渲染)
-// + WioKitLogic(L0)编译成 Windows 程序,硬件边缘由 sim/ 的垫片和仿真桩代替。
+// + WioKitLogic(L0)编译成宿主程序,硬件边缘由 sim/ 的垫片和仿真桩代替。
 // 场景:开机 → 待机 → 摸头 → 三轮语音对话(不同情绪)→ 摇晃 → 犯困 → 睡觉 → 唤醒,
 // 每个阶段导出一帧 PPM(sim/out/,ppm2png.py 转 PNG)。
 //
-// 编译:bash sim/build.sh(需 MSVC;详见脚本)
+// 编译:bash sim/build.sh
 #include "Arduino.h"
 #include "Seeed_GFX.h"
 #include "sim_internals.h"
@@ -23,7 +23,7 @@ static void tap(int pin) {
   sim::setKey(pin, true);
   runFor(100);
   sim::setKey(pin, false);
-  runFor(50);
+  runFor(100);
 }
 
 // 提前结束 ST_SHOW 的展示(等过 400ms 宽限,再按任意键)
@@ -52,7 +52,7 @@ int main() {
   runFor(3500);  // 睁眼动画结束 → 待机
   dump("01_idle");
 
-  tap(WIO_5S_LEFT);  // 摸头
+  tap(WIO_5S_PRESS);  // 压下摇杆摸头(WIO_5S_LEFT/RIGHT 现为切页)
   runFor(300);
   dump("02_pet_happy");
   runFor(1200);  // 展示结束回待机

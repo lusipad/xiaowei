@@ -12,6 +12,8 @@ struct WioConfig {
   char baiduSecret[65];    // Baidu Secret Key
   char deepseekKey[80];    // DeepSeek Key
   char city[33];           // 城市名 (如 "上海")
+  uint8_t activeSkin;      // 当前生效皮肤 (0=小猫小维, 1=DeepSeek大肥鱼)
+  uint8_t reserved[3];
   uint32_t crc;
 };
 

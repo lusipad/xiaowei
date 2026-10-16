@@ -8,6 +8,7 @@ int animCur = A_NONE;
 int animFace = F_NORMAL;
 int animStep = 0;
 unsigned long animNext = 0;
+bool animImmediate = true;
 
 // A_IDLE 内部:眨眼 + 随机小动作(1=张望 2=哼歌 3=歪头)
 bool idleBlinking = false;
@@ -21,7 +22,7 @@ void petAnimSet(int anim, int face = F_NORMAL) {
   animCur = anim;
   animFace = face;
   animStep = 0;
-  animNext = 0;  // 下一次 tick 立即画第一帧
+  animImmediate = true;  // 下一次 tick 立即画第一帧(不依赖 millis()==0 比较)
   const unsigned long now = millis();
   idleBlinking = false;
   idleBlinkAt = now + random(2500, 5000);
@@ -82,18 +83,18 @@ void tickIdle(unsigned long now) {
     drawEyesOnly(F_NORMAL, 0);
     idleBlinking = false;
     idleBlinkAt = now + random(2500, 5000);
-  } else if (now >= idleActAt) {
+  } else if ((long)(now - idleActAt) >= 0) {
     idleAct = random(1, 4);
     idleStep = 0;
     animNext = now;
     return;
-  } else if (now >= idleBlinkAt) {
+  } else if ((long)(now - idleBlinkAt) >= 0) {
     drawEyesOnly(F_BLINK, 0);
     idleBlinking = true;
     animNext = now + 160;
     return;
   }
-  animNext = (idleBlinkAt < idleActAt) ? idleBlinkAt : idleActAt;
+  animNext = ((long)(idleBlinkAt - idleActAt) < 0) ? idleBlinkAt : idleActAt;
 }
 
 extern PetState state;
@@ -103,7 +104,9 @@ void petAnimTick() {
   // 当处于非宠物页面的待机状态时，不画待机小猫动画，以免覆盖时钟或番茄钟看板
   if (state == ST_IDLE && curPage != PAGE_PET) return;
   const unsigned long now = millis();
-  if (animCur == A_NONE || now < animNext) return;
+  if (animCur == A_NONE) return;
+  if (!animImmediate && (long)(now - animNext) < 0) return;
+  animImmediate = false;
   switch (animCur) {
     case A_IDLE:
       tickIdle(now);

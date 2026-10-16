@@ -17,6 +17,7 @@ static MotionDetector motionDet(SHAKE_MG, PICKUP_MG, STILL_MS);
 static unsigned long lightNext = 0, imuNext = 0, senseDbgNext = 0;
 static long lightAvg = -1;
 static int lastAx = 0, lastAy = 0, lastAz = 0;
+static bool isFaceDown = false;
 
 void wioSenseConfig(int darkTh, int lightTh, int shakeMg, int pickupMg, uint32_t stillMs) {
   lightDet.darkTh = darkTh;
@@ -61,24 +62,25 @@ bool wioSenseBegin() {
   return imuOk;
 }
 
-// 非阻塞:到采样时间才读;每次最多返回一个事件
+// 非阻塞:到采样时间才读;每次最多返回一个事件(使用带符号差值防止 millis() 49.7天溢出)
 int wioSensePoll() {
   const unsigned long now = millis();
   int ev = SE_NONE;
-  if (now >= lightNext) {
+  if (lightNext == 0 || (long)(now - lightNext) >= 0) {
     lightNext = now + 500;
     const int raw = readLightShared();
     lightAvg = (lightAvg < 0) ? raw : (lightAvg * 3 + raw) / 4;
     const int r = lightDet.update((int)lightAvg, (uint32_t)now);
 #if WIO_SENSE_LIGHT_ENABLED
-    if (r == 1) ev = SE_DARK;
-    else if (r == 2) ev = SE_LIGHT;
+    if (!isFaceDown) {
+      if (r == 1) ev = SE_DARK;
+      else if (r == 2) ev = SE_LIGHT;
+    }
 #else
     (void)r;
 #endif
   }
-  static bool isFaceDown = false;
-  if (imuOk && now >= imuNext) {
+  if (imuOk && (imuNext == 0 || (long)(now - imuNext) >= 0)) {
     imuNext = now + 50;
     lastAx = (int)(lis.getAccelerationX() * 1000);
     lastAy = (int)(lis.getAccelerationY() * 1000);
@@ -98,13 +100,14 @@ int wioSensePoll() {
     }
 
     const int m = motionDet.update(lastAx, lastAy, lastAz, (uint32_t)now);
-    if (ev == SE_NONE) {
+    // 扣放专注模式下屏蔽摇晃/拿起误触发，避免桌面震动导致亮屏眩晕
+    if (ev == SE_NONE && !isFaceDown) {
       if (m == MOTION_SHAKE) ev = SE_SHAKE;
       else if (m == MOTION_PICKUP) ev = SE_PICKUP;
     }
   }
 #if WIO_SENSE_DEBUG
-  if (now >= senseDbgNext) {
+  if (senseDbgNext == 0 || (long)(now - senseDbgNext) >= 0) {
     senseDbgNext = now + 2000;
     Serial.print("S: light=");
     Serial.print(lightAvg);
@@ -126,5 +129,5 @@ int wioSensePoll() {
 }
 
 bool wioSenseIsFaceDown() {
-  return (lastAz > 650);
+  return isFaceDown;
 }

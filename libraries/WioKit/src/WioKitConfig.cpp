@@ -22,6 +22,22 @@ static uint32_t calcChecksum(const WioConfig& cfg) {
   return sum;
 }
 
+// HTML 属性与正文转义:防止包含单引号(如 "Ming's iPhone")或特殊符号的 SSID 截断 HTML 属性
+static String htmlEscape(const char* s) {
+  if (!s) return String("");
+  String out = "";
+  while (*s) {
+    const char c = *s++;
+    if (c == '&') out += F("&amp;");
+    else if (c == '\'') out += F("&#39;");
+    else if (c == '"') out += F("&quot;");
+    else if (c == '<') out += F("&lt;");
+    else if (c == '>') out += F("&gt;");
+    else out += c;
+  }
+  return out;
+}
+
 bool wioConfigInit() {
   static bool inited = false;
   if (inited) return true;
@@ -45,6 +61,12 @@ bool wioConfigLoad(WioConfig& cfg) {
   }
   if (tmp.magic != WIO_CONFIG_MAGIC) return false;
   if (tmp.crc != calcChecksum(tmp)) return false;
+  tmp.ssid[sizeof(tmp.ssid) - 1] = '\0';
+  tmp.pass[sizeof(tmp.pass) - 1] = '\0';
+  tmp.baiduApiKey[sizeof(tmp.baiduApiKey) - 1] = '\0';
+  tmp.baiduSecret[sizeof(tmp.baiduSecret) - 1] = '\0';
+  tmp.deepseekKey[sizeof(tmp.deepseekKey) - 1] = '\0';
+  tmp.city[sizeof(tmp.city) - 1] = '\0';
   if (strlen(tmp.ssid) == 0) return false;
 
   cfg = tmp;
@@ -103,14 +125,23 @@ static void handlePortalRoot() {
                   "<form action='/save' method='POST'>");
 
   html += F("<label>WiFi 名称 (SSID)</label><input type='text' name='ssid' value='");
-  html += currentPresetCfg.ssid;
+  html += htmlEscape(currentPresetCfg.ssid);
   html += F("' placeholder='输入要连接的 WiFi 名称' required>");
 
-  html += F("<label>WiFi 密码</label><input type='password' name='pass' placeholder='无密码可留空'>");
+  html += F("<label>WiFi 密码</label><input type='password' name='pass' placeholder='");
+  html += (strlen(currentPresetCfg.pass) > 0) ? F("留空保留原密码 (或输入新密码)") : F("无密码可留空");
+  html += F("'>");
 
   html += F("<label>常驻城市 (查天气用)</label><input type='text' name='city' value='");
-  html += (strlen(currentPresetCfg.city) ? currentPresetCfg.city : "上海");
+  html += htmlEscape(strlen(currentPresetCfg.city) ? currentPresetCfg.city : "上海");
   html += F("' placeholder='例如：上海 / 北京 / 深圳'>");
+
+  html += F("<label>桌面皮肤形象</label><select name='skin' style='width:100%;padding:10px;margin-bottom:14px;border:1px solid #ccc;border-radius:8px;font-size:15px;'>"
+            "<option value='0'");
+  if (currentPresetCfg.activeSkin == 0) html += F(" selected");
+  html += F(">🐱 小猫小维 (经典像素)</option><option value='1'");
+  if (currentPresetCfg.activeSkin == 1) html += F(" selected");
+  html += F(">🐋 DeepSeek 女仆大肥鱼</option></select>");
 
   html += F("<details><summary>🔑 自定义 API Key (可选)</summary>"
             "<label>DeepSeek API Key</label><input type='password' name='ds_key' placeholder='留空保留原配置'>"
@@ -141,9 +172,12 @@ static void handlePortalExit() {
 static void handlePortalSave() {
   String ssid = pWebServer->arg("ssid");
   ssid.trim();
+  if (!ssid.length() && strlen(currentPresetCfg.ssid) > 0) {
+    ssid = currentPresetCfg.ssid;
+  }
 
+  // WiFi 密码不做 trim()，以免破坏合法包含首尾空格的 WPA2 密码
   String pass = pWebServer->arg("pass");
-  pass.trim();
 
   String city = pWebServer->arg("city");
   city.trim();
@@ -158,8 +192,20 @@ static void handlePortalSave() {
 
   memset(&portalResultCfg, 0, sizeof(portalResultCfg));
   strncpy(portalResultCfg.ssid, ssid.c_str(), sizeof(portalResultCfg.ssid) - 1);
-  strncpy(portalResultCfg.pass, pass.c_str(), sizeof(portalResultCfg.pass) - 1);
+
+  // 若用户仅修改城市或 API Key 而未重输密码(且 SSID 未变)，自动保留原 WiFi 密码，防止密码被意外清空!
+  if (pass.length() > 0) {
+    strncpy(portalResultCfg.pass, pass.c_str(), sizeof(portalResultCfg.pass) - 1);
+  } else if (strcmp(ssid.c_str(), currentPresetCfg.ssid) == 0 && strlen(currentPresetCfg.pass) > 0) {
+    strncpy(portalResultCfg.pass, currentPresetCfg.pass, sizeof(portalResultCfg.pass) - 1);
+  }
+
   strncpy(portalResultCfg.city, city.c_str(), sizeof(portalResultCfg.city) - 1);
+  if (pWebServer->hasArg("skin")) {
+    portalResultCfg.activeSkin = (uint8_t)pWebServer->arg("skin").toInt();
+  } else {
+    portalResultCfg.activeSkin = currentPresetCfg.activeSkin;
+  }
 
   // 若填写了新 Key 则采用新 Key，否则沿用预置
   if (dsKey.length() > 5) {
@@ -192,20 +238,28 @@ static void handlePortalSave() {
                   "</style></head><body><div class='box'>"
                   "<h2>✅ 配置已保存！</h2>"
                   "<p>小维正在连接 WiFi：<b>");
-  resp += ssid;
+  resp += htmlEscape(ssid.c_str());
   resp += F("</b></p><p>设备将自动重启联网，你可以关闭此网页啦~</p></div></body></html>");
 
   pWebServer->send(200, "text/html", resp);
 }
 
+// Captive Portal 探测与未知路径统一 302 重定向到配网首页，确保 iOS/Android/Windows 自动唤起配网弹窗
 static void handlePortalNotFound() {
-  pWebServer->send(404, "text/plain", "Not Found");
+  pWebServer->sendHeader("Location", "http://192.168.4.1/", true);
+  pWebServer->send(302, "text/plain", "");
 }
 
 bool wioPortalBegin(const char* apSsid, const WioConfig& curCfg) {
   portalSaved = false;
   portalExit = false;
   currentPresetCfg = curCfg;
+
+  if (pWebServer) {
+    pWebServer->stop();
+    delete pWebServer;
+    pWebServer = nullptr;
+  }
 
   WiFi.disconnect();
   delay(50);
@@ -223,6 +277,8 @@ bool wioPortalBegin(const char* apSsid, const WioConfig& curCfg) {
   pWebServer->on("/", HTTP_GET, handlePortalRoot);
   pWebServer->on("/save", HTTP_POST, handlePortalSave);
   pWebServer->on("/exit", HTTP_GET, handlePortalExit);
+  pWebServer->on("/generate_204", HTTP_GET, handlePortalRoot);
+  pWebServer->on("/hotspot-detect.html", HTTP_GET, handlePortalRoot);
   pWebServer->onNotFound(handlePortalNotFound);
   pWebServer->begin();
 

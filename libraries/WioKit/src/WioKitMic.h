@@ -18,6 +18,12 @@ void wioMicConfig(int silenceAvg, uint32_t trailingMs, uint32_t noSpeechMs);
 
 void wioRecStart();
 
+// 立即停止录音(关闭 DMA 写入标志)并返回当前已录制的样本数
+uint32_t wioRecStop();
+
+// 本轮录音是否已检测到有效人声
+bool wioRecHadSpeech();
+
 // 轮询:0=录音中 1=录完(VAD 截断) 2=超时没说话 3=缓冲录满(达到 3 秒上限截断)
 // samples=本次有效样本数;hint=累计有声样本数(应用可忽略)
 int wioRecPoll(uint32_t& samples, uint32_t& hint);
@@ -25,6 +31,6 @@ int wioRecPoll(uint32_t& samples, uint32_t& hint);
 // 内部 PCM,零拷贝;下次 wioRecStart() 前有效
 const int16_t* wioRecBuffer();
 
-// 首尾静音裁剪:调用前 lo=0、hi=样本数;返回后 [lo,hi) 为有效语音区间(不搬数据)。
-// 裁剪阈值 400 为实测值,与 VAD 的 silenceAvg 相互独立。
+// 首尾静音裁剪:调用前 lo=0、hi=样本数;返回后 [lo,hi) 为有效语音区间(含首尾余量,不搬数据)。
+// 若全段均为静音,返回后 lo == hi。
 void wioRecTrim(uint32_t& lo, uint32_t& hi);

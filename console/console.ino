@@ -44,7 +44,7 @@ const Action ACTIONS[] = {
   {"commit",    "3 Commit Msg [clipboard]"},
   {"inspire",   "4 Inspire"},
   {"hello",     "5 Hello Test"},
-  {"voice",     "6 Voice Ask (MiMo)"},
+  {"voice",     "6 Voice Ask (Baidu)"},
   {"deepseek",  "7 DeepSeek Cloud"},
 };
 const int ACTION_COUNT = sizeof(ACTIONS) / sizeof(ACTIONS[0]);
@@ -239,7 +239,7 @@ void startAction(int idx) {
 
   if (strcmp(ACTIONS[idx].id, "voice") == 0) {
 #if WIO_HAS_WIFI
-    runVoiceAsk();  // 录音 -> MiMo ASR -> MiMo LLM -> 屏幕
+    runVoiceAsk();  // 录音 -> 百度 ASR -> DeepSeek LLM -> 屏幕
 #else
     finishAction(true, "missing wifi_secrets.h - see README");
 #endif
@@ -312,13 +312,14 @@ bool wifiEnsureConnected() {
   return false;
 }
 
+#include "voice.h"  // 语音链路:录音/ASR/LLM(放在这里确保 readHttpBody 等可被复用)
+
 void runDeepSeek() {
   if (!wifiEnsureConnected()) {
     finishAction(true, "wifi connect failed");
     return;
   }
 
-  // 屏幕暂无中文字库,让模型输出"英文一行 + 中文一行",英文行可直接显示
   const char* prompt =
       "Reply with exactly two lines and nothing else. "
       "Line 1: one witty one-liner for programmers, simple English, max 15 words. "
@@ -339,7 +340,7 @@ void runDeepSeek() {
     return;
   }
 
-  String request = "POST /chat/completions HTTP/1.1\r\n"
+  String request = "POST /v1/chat/completions HTTP/1.1\r\n"
                    "Host: api.deepseek.com\r\n"
                    "Authorization: Bearer " DEEPSEEK_KEY "\r\n"
                    "Content-Type: application/json\r\n"
@@ -350,34 +351,10 @@ void runDeepSeek() {
   request += body;
   client.print(request);
 
-  String payload;
-  const unsigned long start = millis();
-  while ((client.connected() || client.available()) && payload.length() < 16000) {
-    while (client.available()) payload += (char)client.read();
-    if (millis() - start > 30000) break;
-    delay(5);
-  }
-  client.stop();
-
-  const int headerEnd = payload.indexOf("\r\n\r\n");
-  if (headerEnd < 0 || !payload.startsWith("HTTP/1.1 200") ) {
+  String httpBody;
+  if (!readHttpBody(client, httpBody, 30000, "deepseek")) {
     finishAction(true, "http error - check key/ssid");
     return;
-  }
-  String httpBody = payload.substring(headerEnd + 4);
-
-  if (payload.indexOf("chunked") >= 0) {  // chunked 传输编码解包
-    String decoded;
-    int pos = 0;
-    while (pos < (int)httpBody.length()) {
-      const int lineEnd = httpBody.indexOf("\r\n", pos);
-      if (lineEnd < 0) break;
-      const int chunkLen = (int)strtol(httpBody.substring(pos, lineEnd).c_str(), NULL, 16);
-      if (chunkLen == 0) break;
-      decoded += httpBody.substring(lineEnd + 2, lineEnd + 2 + chunkLen);
-      pos = lineEnd + 2 + chunkLen + 2;
-    }
-    httpBody = decoded;
   }
 
   JsonDocument resp;
@@ -393,8 +370,6 @@ void runDeepSeek() {
   storeText(content);
   finishAction(false, "direct deepseek ok");
 }
-
-#include "voice.h"  // 语音链路:录音/ASR/LLM(放在这里确保依赖的类型和函数都已定义)
 #endif
 
 void handleHostLine(const char* line) {

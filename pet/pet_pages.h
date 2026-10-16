@@ -87,31 +87,39 @@ static void fromUnixEpoch(uint32_t epoch, int& yr, int& mo, int& d, int& h, int&
 
 // 快速通过百度 HTTP 标头对时
 bool syncNetworkTime() {
+  // 无论成功或失败均先推进 nextTimeSyncMs(失败后退避 5 分钟再试)，彻底防止 loop() 陷入无限重连死循环!
+  nextTimeSyncMs = millis() + 300000UL;
   if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClient client;
-  if (!client.connect("www.baidu.com", 80, 2000)) return false;
+  if (!client.connect("www.baidu.com", 80, 2000)) {
+    client.stop();
+    return false;
+  }
   client.setTimeout(400);
   client.print("HEAD / HTTP/1.1\r\nHost: www.baidu.com\r\nConnection: close\r\n\r\n");
   const unsigned long t0 = millis();
-  while (!client.available() && millis() - t0 < 1500) delay(10);
   bool ok = false;
-  while (client.available()) {
-    String line = client.readStringUntil('\n');
-    line.trim();
-    if (line.startsWith("Date: ") || line.startsWith("date: ")) {
-      int yr = 0, mo = 0, d = 0, h = 0, m = 0, s = 0;
-      if (parseHttpDate(line.c_str() + 6, yr, mo, d, h, m, s)) {
-        netEpochBase = toUnixEpoch(yr, mo, d, h, m, s);
-        netEpochMillis = millis();
-        hasSyncedTime = true;
-        nextTimeSyncMs = millis() + 3600000UL;  // 每小时同步一次
-        ok = true;
-        Serial.print("V: time synced from HTTP: ");
-        Serial.print(yr); Serial.print("-"); Serial.print(mo); Serial.print("-"); Serial.print(d);
-        Serial.print(" "); Serial.print(h); Serial.print(":"); Serial.print(m); Serial.print(":"); Serial.println(s);
-        break;
+  while (millis() - t0 < 1500) {
+    while (client.available()) {
+      String line = client.readStringUntil('\n');
+      line.trim();
+      if (line.startsWith("Date: ") || line.startsWith("date: ")) {
+        int yr = 0, mo = 0, d = 0, h = 0, m = 0, s = 0;
+        if (parseHttpDate(line.c_str() + 6, yr, mo, d, h, m, s)) {
+          netEpochBase = toUnixEpoch(yr, mo, d, h, m, s);
+          netEpochMillis = millis();
+          hasSyncedTime = true;
+          nextTimeSyncMs = millis() + 3600000UL;  // 成功后每小时同步一次
+          ok = true;
+          Serial.print("V: time synced from HTTP: ");
+          Serial.print(yr); Serial.print("-"); Serial.print(mo); Serial.print("-"); Serial.print(d);
+          Serial.print(" "); Serial.print(h); Serial.print(":"); Serial.print(m); Serial.print(":"); Serial.println(s);
+          break;
+        }
       }
     }
+    if (ok) break;
+    delay(10);
   }
   client.stop();
   return ok;
@@ -163,6 +171,25 @@ static int lastClockSec = -1;
 static int lastClockMin = -1;
 static int lastClockHour = -1;
 static int lastClockDay = -1;
+static int lastClockWifi = -1;
+
+// 限制城市名最多显示 3 个汉字(9字节 UTF-8)，防止长城市名(如乌鲁木齐)侵入右侧日期区域(x=74)
+static void formatShortCity(char out[16]) {
+  const char* src = (hasActiveConfig && strlen(activeConfig.city) > 0) ? activeConfig.city : "上海";
+  size_t pos = 0;
+  int chars = 0;
+  while (src[pos] && chars < 3 && pos < 12) {
+    unsigned char b = (unsigned char)src[pos];
+    size_t step = (b >= 0xF0) ? 4 : (b >= 0xE0 ? 3 : (b >= 0xC0 ? 2 : 1));
+    if (pos + step > 12) break;
+    for (size_t k = 0; k < step && src[pos]; k++) {
+      out[pos] = src[pos];
+      pos++;
+    }
+    chars++;
+  }
+  out[pos] = '\0';
+}
 
 void drawClockPage(bool fullRedraw = true) {
   int yr, mo, d, h, m, s, wday;
@@ -173,19 +200,9 @@ void drawClockPage(bool fullRedraw = true) {
 
     // 1. 顶部状态栏: 城市 + 日期与星期 + WiFi 状态 (单次绘制，无闪烁)
     char locBuf[16];
-    snprintf(locBuf, sizeof(locBuf), "%s", (hasActiveConfig && strlen(activeConfig.city) > 0) ? activeConfig.city : "上海");
-    drawTextCJK(locBuf, 16, 8, 80, C_TIME_CYAN, C_BG_PAGE);
+    formatShortCity(locBuf);
+    drawTextCJK(locBuf, 16, 8, 72, C_TIME_CYAN, C_BG_PAGE);
 
-    static const char* const W_NAMES[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
-    char dateBuf[48];
-    snprintf(dateBuf, sizeof(dateBuf), "%04d年%02d月%02d日 %s", yr, mo, d, W_NAMES[wday]);
-    drawTextCJK(dateBuf, 74, 8, 250, 0xDEFB, C_BG_PAGE);
-
-    if (WiFi.status() == WL_CONNECTED) {
-      drawTextCJK("WiFi", 274, 8, 312, 0x07E0, C_BG_PAGE);
-    } else {
-      drawTextCJK("离线", 274, 8, 312, 0x7BEF, C_BG_PAGE);
-    }
     display.drawFastHLine(14, 32, 292, C_DIVIDER);
 
     // 2. 秒数副标
@@ -200,16 +217,29 @@ void drawClockPage(bool fullRedraw = true) {
     lastClockMin = -1;
     lastClockHour = -1;
     lastClockDay = -1;
+    lastClockWifi = -1;
   }
 
-  // 跨天刷新顶部日期
+  // 动态刷新右上角 WiFi 在线/离线状态
+  const int curWifi = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
+  if (curWifi != lastClockWifi) {
+    lastClockWifi = curWifi;
+    display.fillRect(272, 8, 40, 20, C_BG_PAGE);
+    if (curWifi) {
+      drawTextCJK("WiFi", 274, 8, 312, 0x07E0, C_BG_PAGE);
+    } else {
+      drawTextCJK("离线", 274, 8, 312, 0x7BEF, C_BG_PAGE);
+    }
+  }
+
+  // 跨天或全量重绘时刷新顶部日期
   if (d != lastClockDay) {
     lastClockDay = d;
     display.fillRect(74, 8, 196, 20, C_BG_PAGE);
     static const char* const W_NAMES[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
     char dateBuf[48];
     snprintf(dateBuf, sizeof(dateBuf), "%04d年%02d月%02d日 %s", yr, mo, d, W_NAMES[wday]);
-    drawTextCJK(dateBuf, 74, 8, 250, 0xDEFB, C_BG_PAGE);
+    drawTextCJK(dateBuf, 74, 8, 268, 0xDEFB, C_BG_PAGE);
   }
 
   // 核心时间: HH:MM 仅在分钟改变时刷新 (Font 8: 75 像素巨大字体，直写无 fillRect，杜绝闪烁!)
@@ -256,6 +286,7 @@ void drawClockPage(bool fullRedraw = true) {
 
 static int lastPomoSec = -1;
 static int lastPomoRunState = -1;
+static int lastPomoCompleted = -1;
 
 void drawFocusPage(bool fullRedraw = true) {
   if (fullRedraw) {
@@ -263,9 +294,6 @@ void drawFocusPage(bool fullRedraw = true) {
 
     // 顶部状态栏
     drawTextCJK("番茄钟专注", 16, 8, 120, C_POMO_RED, C_BG_PAGE);
-    char totalBuf[32];
-    snprintf(totalBuf, sizeof(totalBuf), "今日专注: %d 次", pomoCompletedTotal);
-    drawTextCJK(totalBuf, 195, 8, 304, C_TIME_GOLD, C_BG_PAGE);
     display.drawFastHLine(14, 32, 292, C_DIVIDER);
 
     // 底部操作栏提示
@@ -274,6 +302,16 @@ void drawFocusPage(bool fullRedraw = true) {
 
     lastPomoSec = -1;
     lastPomoRunState = -1;
+    lastPomoCompleted = -1;
+  }
+
+  // 动态更新右上角"今日专注: N 次"计数(番茄钟倒计时归零完成时实时刷新!)
+  if (pomoCompletedTotal != lastPomoCompleted) {
+    lastPomoCompleted = pomoCompletedTotal;
+    display.fillRect(190, 8, 120, 20, C_BG_PAGE);
+    char totalBuf[32];
+    snprintf(totalBuf, sizeof(totalBuf), "今日专注: %d 次", pomoCompletedTotal);
+    drawTextCJK(totalBuf, 195, 8, 312, C_TIME_GOLD, C_BG_PAGE);
   }
 
   // 剩余秒数

@@ -1,14 +1,16 @@
-// 硬件仿真桩:WioKit 的 Mic/Sense/AsrBaidu/LlmDeepSeek 四个模块在宿主上的替身。
+// 硬件仿真桩:WioKit 的 Mic/Sense/Config/AsrBaidu/LlmDeepSeek 模块在宿主上的替身。
 // 桩保持与真模块相同的 API 和计时记账;麦克风给出"说话 1.5s + 静音"的合成波形,
 // 云端返回脚本台词(台词里的情绪标签仍由真实 L0 parseEmotionTag 解析)。
 #include "Arduino.h"
 #include "sim_internals.h"
 #include <WioKitAsrBaidu.h>
+#include <WioKitConfig.h>
 #include <WioKitLlmDeepSeek.h>
 #include <WioKitMic.h>
 #include <WioKitSense.h>
 #include <WioKitTiming.h>
 
+#include <cstring>
 #include <vector>
 
 // ---- 麦克风:开始录音后 1.5s 合成"说话"(1kHz 正弦,幅度 2000),之后静音;
@@ -17,6 +19,7 @@ static int16_t g_pcm[48000];
 static bool g_recording = false;
 static uint32_t g_recStart = 0;
 static uint32_t g_samples = 0;
+static bool g_hadSpeech = false;
 
 bool wioMicBegin() {
   Serial.println("V: mic init ok (sim)");
@@ -27,6 +30,14 @@ void wioRecStart() {
   g_recording = true;
   g_recStart = millis();
   g_samples = 0;
+  g_hadSpeech = false;
+}
+uint32_t wioRecStop() {
+  g_recording = false;
+  return g_samples;
+}
+bool wioRecHadSpeech() {
+  return g_hadSpeech;
 }
 int wioRecPoll(uint32_t& samples, uint32_t& hint) {
   if (g_recording) {
@@ -34,14 +45,15 @@ int wioRecPoll(uint32_t& samples, uint32_t& hint) {
     const uint32_t target = elapsed > 3000 ? 48000 : elapsed * 16;  // 16kHz
     while (g_samples < target && g_samples < 48000) {
       const bool speaking = elapsed < 1500;
+      if (speaking) g_hadSpeech = true;
       // 说话段:1kHz 方波幅度 1800(让真实裁剪逻辑有东西可裁);静音段:小幅噪声
       g_pcm[g_samples++] = speaking ? (int16_t)((g_samples % 16 < 8) ? 1800 : -1800)
                                     : (int16_t)((int)(g_samples % 7) - 3);
     }
+    samples = g_samples;
+    hint = g_samples;
     if (elapsed > 2400) {  // 说话 1.5s + 截断静音 0.9s
       g_recording = false;
-      samples = g_samples;
-      hint = g_samples;
       return 1;
     }
   }
@@ -64,6 +76,25 @@ int wioSensePoll() {
   if (sim::nextSenseEvent(ev)) return ev;
   return SE_NONE;
 }
+bool wioSenseIsFaceDown() { return false; }
+
+// ---- 配置持久化与配网桩 ----
+bool wioConfigInit() { return true; }
+bool wioConfigLoad(WioConfig& cfg) {
+  std::memset(&cfg, 0, sizeof(cfg));
+  std::strncpy(cfg.ssid, "SimWiFi", sizeof(cfg.ssid) - 1);
+  std::strncpy(cfg.pass, "simpass", sizeof(cfg.pass) - 1);
+  std::strncpy(cfg.baiduApiKey, "sim_baidu_key", sizeof(cfg.baiduApiKey) - 1);
+  std::strncpy(cfg.baiduSecret, "sim_baidu_secret", sizeof(cfg.baiduSecret) - 1);
+  std::strncpy(cfg.deepseekKey, "sim_deepseek_key", sizeof(cfg.deepseekKey) - 1);
+  std::strncpy(cfg.city, "上海", sizeof(cfg.city) - 1);
+  return true;
+}
+bool wioConfigSave(const WioConfig&) { return true; }
+bool wioConfigClear() { return true; }
+bool wioPortalBegin(const char*, const WioConfig&) { return true; }
+int wioPortalPoll(WioConfig&) { return 0; }
+void wioPortalEnd() {}
 
 // ---- 百度 ASR 桩:net 阶段记账,返回脚本转写 ----
 void wioAsrBaiduBegin(const char*, const char*) {}
@@ -88,7 +119,7 @@ bool wioAsrBaidu(const int16_t* pcm, uint32_t n, String& transcript, String& not
 
 // ---- DeepSeek 桩:返回脚本台词(含情绪标签) ----
 void wioLlmDeepSeekBegin(const char*, const char*) {}
-bool wioLlmAsk(const String& question, String& reply, String& note) {
+bool wioLlmAskWithHistory(const WioLlmMsg*, size_t, const String& question, String& reply, String& note) {
   wioTiming().llmConn = 980;
   wioTiming().llm = 1900;
   reply = sim::nextReply();

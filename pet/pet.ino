@@ -1,12 +1,17 @@
 // 小维(Wio)—— AI 电子桌宠
 // 开机即宠物:待机会眨眼、张望、哼歌;按一下 B 开始听,说完自动发送;
-// 语音 → 百度ASR → DeepSeek → 对话气泡(汉字);摇杆左右 = 摸头。
+// 语音 → 百度ASR → DeepSeek → 对话气泡(汉字);摇杆左右 = 切页,下压 = 摸头。
 // 硬件能力(录音/渲染/网络/传感器)在 libraries/WioKit,这里只保留应用层:
 // 状态机、表情人设(pet_face/pet_anim)、系统提示词、密钥。
 
 #include <Arduino.h>
+#if defined(_MSC_VER)
+#include "unistd.h"
+#else
 #include <unistd.h>
+#endif
 #include <Seeed_GFX.h>
+#include "pet_skin_manager.h"
 
 enum PetState { ST_IDLE, ST_RECORD, ST_THINK, ST_SHOW, ST_SLEEP, ST_CONFIG };
 PetState state = ST_IDLE;
@@ -21,6 +26,9 @@ PetState state = ST_IDLE;
 #include <WioKitConfig.h>      // L1 配置持久化 + SoftAP 网页配网
 #include <WioKitAsrBaidu.h>    // L2 百度 ASR
 #include <WioKitLlmDeepSeek.h> // L2 DeepSeek
+#if defined(ARDUINO)
+#include <sfud.h>
+#endif
 
 // ---- 默认密钥/回退:若本地有 wifi_secrets.h 且未指定发布模式则用作开发调试缺省值 ----
 #if __has_include("wifi_secrets.h") && !defined(PET_RELEASE_BUILD)
@@ -60,27 +68,36 @@ bool pomoRunning = false;
 uint32_t pomoLastTickMs = 0;
 int pomoCompletedTotal = 0;
 bool pomoJustFinished = false;
+unsigned long lastInteract = 0;  // 最近一次有人互动(按键/摸头/拿起/专注)
 
 void startPomodoro() {
+  // 若上一轮番茄钟已归零结束，再次启动时自动重置为 25 分钟满时长
+  if (pomoRemainingSec == 0) {
+    pomoRemainingSec = POMO_DURATION_SEC;
+  }
   if (!pomoRunning) {
     pomoRunning = true;
     pomoLastTickMs = millis();
   }
+  lastInteract = millis();
 }
 
 void pausePomodoro() {
   pomoRunning = false;
+  lastInteract = millis();
 }
 
 void resetPomodoro() {
   pomoRunning = false;
   pomoRemainingSec = POMO_DURATION_SEC;
   pomoJustFinished = false;
+  lastInteract = millis();
 }
 
 void tickPomodoroLogic() {
   if (!pomoRunning) return;
   const unsigned long now = millis();
+  lastInteract = now;  // 专注进行期间持续刷新互动时间，防止 25 分钟结束瞬间因 idleFor>5min 立即误入沉睡!
   if (now - pomoLastTickMs >= 1000) {
     const uint32_t secPassed = (now - pomoLastTickMs) / 1000;
     pomoLastTickMs += secPassed * 1000;
@@ -111,15 +128,78 @@ void beep(int freq, int dur) {
 const uint32_t PET_TRAILING_MS = 1200;  // 说完静音多久自动停(放宽到1.2s,避免换气断句)
 
 // ============================================================
+// 按键边沿检测与注入(彻底杜绝长按连续重入导致按 B 后 0.2s 秒进"让我想想"!)
+// ============================================================
+
+static int injectedKey = -1;
+static bool keyWasDown[8] = {false};
+static unsigned long keyLastChangeMs[8] = {0};
+
+static int findKeyIndex(int pin) {
+  for (int i = 0; i < 8; i++) {
+    if (ALL_KEYS[i] == pin) return i;
+  }
+  return -1;
+}
+
+void syncKeyStates() {
+  const unsigned long now = millis();
+  for (int i = 0; i < 8; i++) {
+    keyWasDown[i] = (digitalRead(ALL_KEYS[i]) == LOW);
+    keyLastChangeMs[i] = now;
+  }
+}
+
+void petInjectKey(int pin) {
+  injectedKey = pin;
+}
+
+bool pressed(int pin) {
+  if (injectedKey == pin) {
+    injectedKey = -1;
+    return true;
+  }
+  const int idx = findKeyIndex(pin);
+  const bool isDown = (digitalRead(pin) == LOW);
+  const unsigned long now = millis();
+  if (idx < 0) return isDown;
+
+  // 先检测按键释放(必须先松开再按下才算新一次点击，彻底根治同一次按键跨状态重入)
+  if (!isDown) {
+    if (keyWasDown[idx] && (now - keyLastChangeMs[idx] >= 25)) {
+      keyWasDown[idx] = false;
+      keyLastChangeMs[idx] = now;
+    }
+    return false;
+  }
+  if (!keyWasDown[idx] && (now - keyLastChangeMs[idx] >= 80)) {
+    keyWasDown[idx] = true;
+    keyLastChangeMs[idx] = now;
+    return true;
+  }
+  return false;
+}
+
+bool anyKeyDown() {
+  for (int i = 0; i < 8; i++) {
+    if (digitalRead(ALL_KEYS[i]) == LOW) return true;
+  }
+  return false;
+}
+
+// ============================================================
 // 语音链路编排(应用层):裁剪 → 识别 → 回答 → 情绪标签
 // ============================================================
 
+unsigned long stateStart = 0;
+unsigned long showDurMs = 0;
+static bool thinkUserCancelled = false;
+static bool thinkWatchdogTimeout = false;
+
 const char* getPetSystemPrompt() {
-  petSysPrompt = "你是电子桌宠\"小维\",性格活泼元气,说话简短、口语化、爱用感叹号。"
-                 "回答必须以情绪标签开头,格式如 [开心],情绪只能从 开心/兴奋/惊讶/害羞/疑惑/难过 里选一个;"
-                 "标签后直接是回答正文,用简体中文,45字以内,不要使用Emoji表情,不要使用Markdown符号(如*、#),直接说纯文本。";
+  petSysPrompt = petSkinGetPrompt();
   if (hasActiveConfig && strlen(activeConfig.city) > 0) {
-    petSysPrompt += "主人常驻城市是: ";
+    petSysPrompt += " 主人常驻城市是: ";
     petSysPrompt += activeConfig.city;
     petSysPrompt += "。被问及天气时据此作答。";
   }
@@ -132,9 +212,32 @@ void petYieldLoop() {
   petAnimTick();
 }
 
+bool petNetAbortCheck() {
+  handleTestCommands();
+  if (thinkUserCancelled || thinkWatchdogTimeout) return true;
+  if (state == ST_THINK && (millis() - stateStart > 250)) {
+    if (pressed(PIN_KEY_C)) {
+      Serial.println("V: user cancelled ST_THINK via KEY_C");
+      thinkUserCancelled = true;
+      return true;
+    }
+    // 思考总时长硬看门狗(28 秒)，绝不允许永久卡死在"让我想想"
+    if (millis() - stateStart > 28000) {
+      Serial.println("V: ST_THINK hard watchdog timeout");
+      thinkWatchdogTimeout = true;
+      return true;
+    }
+  }
+  return false;
+}
+
 void applyActiveConfig() {
+  wioNetSetYield(petYieldLoop);
+  wioNetSetAbort(petNetAbortCheck);
+  if (hasActiveConfig) {
+    petSkinSet(activeConfig.activeSkin);
+  }
   if (hasActiveConfig && strlen(activeConfig.ssid) > 0) {
-    wioNetSetYield(petYieldLoop);
     wioNetBegin(activeConfig.ssid, activeConfig.pass);
     wioAsrBaiduBegin(activeConfig.baiduApiKey, activeConfig.baiduSecret);
     wioLlmDeepSeekBegin(activeConfig.deepseekKey, getPetSystemPrompt());
@@ -184,17 +287,18 @@ void petPrintTiming(uint32_t processMs) {
   Serial.println(PET_TRAILING_MS + processMs);
 }
 
-// 开机预连:WiFi(只试 1 次,≤15s)+ 百度 token。失败不阻止开机:离线照常做宠物,按 B 时再连
+// 开机预连:WiFi(只试 1 次,≤10s)+ 百度 token。失败不阻止开机:离线照常做宠物,按 B 时再连
 void petNetWarmup() {
   if (!hasActiveConfig || strlen(activeConfig.ssid) == 0) {
     Serial.println("V: no wifi config, skipping warmup");
     return;
   }
+  wioNetResetAbort();
   const uint32_t t0 = millis();
 #if PET_TEST_OFFLINE
   const bool ok = false;  // 测试:模拟开机时无网
 #else
-  const bool ok = wioNetConnected(1) && wioAsrBaiduWarmup();
+  const bool ok = wioNetConnected(1, 10000) && wioAsrBaiduWarmup();
 #endif
   Serial.print("V: warmup ");
   Serial.print(ok ? "ok" : "failed");
@@ -210,16 +314,39 @@ bool petProcessVoice(uint32_t samples, bool bufferFull, String& transcript, Stri
   note = "";
   emotion = EMO_HAPPY;
   wioTimingReset();
+  wioNetResetAbort();
+  thinkUserCancelled = false;
+  thinkWatchdogTimeout = false;
 
   if (!hasActiveConfig || strlen(activeConfig.ssid) == 0) {
     note = "wifi not configured";
     return false;
   }
 
+  if (samples == 0) {
+    note = "asr no speech";
+    return false;
+  }
+
   // 静音裁剪:去掉首尾低于阈值的段,只留有效语音(+100ms 余量)
   uint32_t lo = 0, hi = samples;
   wioRecTrim(lo, hi);
-  if (hi - lo < 3200) { lo = 0; hi = samples; }  // 太短就整段
+  if (hi <= lo) {
+    note = "asr no speech";
+    return false;
+  }
+  if (hi - lo < 3200) {
+    // 有效语音不足 0.2s 时向两侧适当扩充至 3200 样本，绝不扩回整段 48000 静音
+    if (samples <= 3200) {
+      lo = 0;
+      hi = samples;
+    } else if (lo + 3200 <= samples) {
+      hi = lo + 3200;
+    } else {
+      lo = samples - 3200;
+      hi = samples;
+    }
+  }
   const uint32_t n = hi - lo;
   Serial.print("V: trimmed ");
   Serial.print(samples);
@@ -227,7 +354,7 @@ bool petProcessVoice(uint32_t samples, bool bufferFull, String& transcript, Stri
   Serial.println(n);
 
   if (!wioAsrBaidu(wioRecBuffer() + lo, n, transcript, note)) {
-    if (bufferFull) {
+    if (bufferFull && note == "asr rejected") {
       note = "asr buffer full";
     }
     return false;
@@ -235,6 +362,9 @@ bool petProcessVoice(uint32_t samples, bool bufferFull, String& transcript, Stri
   if (!hasActiveConfig || strlen(activeConfig.deepseekKey) < 5) {
     return true;  // 只识别,无回答
   }
+
+  // 识别出文字后立即刷新气泡第一行，让用户即时看到识别结果，消除"卡死感"
+  drawBubbleText("你:" + transcript, 0x8410, String(petSkinGetName()) + "正在思考… (按 C 取消)", 0x7BEF);
 
   // 90 秒无互动则清除过期历史
   if (chatHistoryCount > 0 && millis() - lastChatTime > CHAT_CONTEXT_EXPIRE_MS) {
@@ -246,14 +376,14 @@ bool petProcessVoice(uint32_t samples, bool bufferFull, String& transcript, Stri
   if (!wioLlmAskWithHistory(chatHistory, chatHistoryCount, transcript, raw, note)) return false;
   size_t textStart = 0;
   emotion = parseEmotionTag(raw.c_str(), raw.length(), &textStart);
-  reply = raw.substring(textStart);  // 标签不上屏
+  reply = raw.substring((unsigned int)textStart);  // 标签不上屏
   if (!reply.length()) {  // 空回复,或只给了标签没有正文
     note = "llm empty reply";
     return false;
   }
 
-  // 记录本轮对话进多轮上下文
-  addChatHistory(transcript, reply);
+  // 记录本轮对话进多轮上下文(保留情绪标签前缀,防止模型在后续轮次模仿无标签格式)
+  addChatHistory(transcript, raw);
   return true;
 }
 
@@ -280,11 +410,9 @@ void petSetState(PetState s) {
     Serial.println(petStateStr(s));
   }
 }
-unsigned long stateStart = 0;
-unsigned long showUntil = 0;
 uint32_t recSamples = 0;
 bool recBufferFull = false;
-unsigned long lastInteract = 0;              // 最近一次有人互动(按键/摸头/拿起)
+static bool recKeyBReleased = false;
 const unsigned long PET_DROWSY_MS = 180000;  // 3 分钟没人理 → 犯困
 const unsigned long PET_SLEEP_MS = 300000;   // 5 分钟 → 睡觉
 const int PET_DIM_LEVEL = 40;                // 睡觉时背光 PWM(0-255)
@@ -306,16 +434,50 @@ const int EMO_FACE[6] = {F_HAPPY, F_EXCITED, F_SURPRISED, F_SHY, F_CONFUSED, F_S
 // 把技术性 note 翻成小维口吻(原 note 仍显示在第二行,方便排查)
 String friendlyNote(const String& note) {
   if (note.startsWith("asr buffer full")) return "一句话太长啦~";
+  if (note.startsWith("asr no speech")) return "没听到声音呀~";
   if (note.startsWith("wifi")) return "我连不上 WiFi 啦…";
   if (note.startsWith("asr rejected")) return "没听清,再说一遍嘛~";
   if (note.startsWith("asr")) return "耳朵(语音识别)出故障了";
   if (note.startsWith("baidu")) return "语音服务登录失败了";
+  if (note.startsWith("llm auth")) return "DeepSeek 密钥无效哦";
+  if (note.startsWith("llm balance")) return "DeepSeek 余额不足啦";
+  if (note.startsWith("llm rate")) return "提问太快啦,歇一会~";
   if (note.startsWith("llm")) return "脑袋(DeepSeek)卡住了";
   return "出了点小状况";
 }
 
+void drawBottomBar(const String& text, int x = -1, uint16_t textColor = TFT_LIGHTGREY) {
+  const uint16_t bg = petSkinGetBottomBg();
+  const int bx = 6, by = 208, bw = 308, bh = 29;
+
+  if (currentSkinId == 1 && hasDsSkin) {
+    // DeepSeek 大肥鱼主题：动态绘制高质感双层科技边框与圆角底框
+    display.fillRoundRect(bx, by, bw, bh, 4, bg);
+    display.drawRoundRect(bx, by, bw, bh, 4, 0x0000);              // 黑色外描边
+    display.drawRoundRect(bx + 1, by + 1, bw - 2, bh - 2, 3, 0x4478); // DeepSeek 标志性海洋蓝内描边高光
+  } else {
+    // 小猫主题：原画 PET_SCENE_BG 已内嵌复古像素黑框，清空内部文本区防止字符残影
+    display.fillRect(10, 210, 300, 26, bg);
+  }
+
+  // 自动计算水平居中位置 (若未显式指定 x >= 0)
+  if (x < 0) {
+    int w = 0;
+    const uint8_t* p = (const uint8_t*)text.c_str();
+    while (*p) {
+      if (*p >= 0xE0 && *p <= 0xEF) { w += 16; p += 3; }
+      else if (*p >= 0x80) { w += 16; p += 2; }
+      else { w += 8; p++; }
+    }
+    x = (320 - w) / 2;
+    if (x < 12) x = 12;
+  }
+
+  drawTextCJK(text.c_str(), x, 215, 320, textColor, bg);
+}
+
 void drawIdleHint() {
-  drawTextCJK("按 B 说话 | 摇杆切页 | 压下互动", 34, 218, 320, TFT_LIGHTGREY, C_BOTTOM_BG);
+  drawBottomBar("按 B 说话 | 摇杆切页 | 压下互动", 34, TFT_LIGHTGREY);
 }
 
 void switchPage(int newPage) {
@@ -337,13 +499,33 @@ void switchPage(int newPage) {
   }
 }
 
+void enterIdle();
+
+void startVoiceRecord() {
+  lastInteract = millis();
+  setBacklightPower(true);
+  beep(988, 50);
+  delay(55);  // 等蜂鸣音彻底播完再开麦,杜绝麦克风采集到蜂鸣声造成误触发
+  wioRecStart();
+  petSetState(ST_RECORD);
+  stateStart = millis();
+  recKeyBReleased = (digitalRead(PIN_KEY_B) != LOW);
+  syncKeyStates();
+  drawPet(F_LISTEN);
+  drawBubbleText("在听…说完我会自己停", TFT_BLACK, "也可再按 B 立即发送 / C 取消", TFT_BLACK);
+  drawBottomBar("正在聆听… | 按 B 立即发送 | 按 C 取消", 18, TFT_LIGHTGREY);
+  petAnimSet(A_LISTEN);
+}
+
 void enterConfig() {
+  wioRecStop();
   petSetState(ST_CONFIG);
   stateStart = millis();
+  syncKeyStates();
   beep(1200, 80);
   drawPet(F_LISTEN);
   drawBubbleText("手机连接热点: Wio-Pet", TFT_BLACK, "打开网页 192.168.4.1", TFT_BLACK);
-  drawTextCJK("手机完成配置 | 按 B 退出", 64, 218, 320, TFT_LIGHTGREY, C_BOTTOM_BG);
+  drawBottomBar("手机完成配置 | 按 B 退出", 64, TFT_LIGHTGREY);
   petAnimSet(A_LISTEN);
   if (!wioPortalBegin("Wio-Pet", activeConfig)) {
     Serial.println("V: portal start failed");
@@ -353,8 +535,10 @@ void enterConfig() {
 }
 
 void enterIdle() {
+  wioRecStop();
   petSetState(ST_IDLE);
   stateStart = millis();
+  syncKeyStates();
   curPage = lastPageBeforeVoice;
   if (curPage == PAGE_PET) {
     drawPet(F_NORMAL);
@@ -367,13 +551,32 @@ void enterIdle() {
   }
 }
 
+void enterThink(uint32_t samples, bool bufFull) {
+  recSamples = samples;
+  recBufferFull = bufFull;
+  beep(880, 50);
+  petSetState(ST_THINK);
+  stateStart = millis();
+  syncKeyStates();
+  drawPet(F_THINK);
+  drawBubbleText("让我想想…", TFT_BLACK, "正在识别语音 (按 C 取消)", 0x7BEF);
+  drawBottomBar("思考中… | 按 C 键可立即取消", 52, TFT_LIGHTGREY);
+  petAnimSet(A_THINK);
+}
+
 // 显示一段表情 + 气泡,durMs 后自动回待机(期间按键也可提前返回)
 void enterShow(int face, const String& t1, uint16_t c1, const String& t2, uint32_t durMs) {
   petSetState(ST_SHOW);
   stateStart = millis();
-  showUntil = millis() + durMs;
+  showDurMs = durMs;
+  syncKeyStates();
   drawPet(face);
-  if (t1.length()) drawBubbleText(t1, c1, t2, TFT_BLACK);
+  if (t1.length()) {
+    drawBubbleText(t1, c1, t2, TFT_BLACK);
+    drawBottomBar("按 B 继续对话 | 其他键返回", 56, TFT_LIGHTGREY);
+  } else {
+    drawIdleHint();
+  }
   petAnimSet(A_EMOTE, face);
 }
 
@@ -382,7 +585,9 @@ void enterSleep() {
   clearChatHistory();
   petSetState(ST_SLEEP);
   stateStart = millis();
+  syncKeyStates();
   drawPet(F_SLEEP);
+  drawBottomBar("沉睡中 zzz | 按任意键唤醒", 60, 0x7BEF);
   petAnimSet(A_SLEEP);
   setBacklight(true);
 }
@@ -390,20 +595,31 @@ void enterSleep() {
 void wakeUp() {
   Serial.println("P: wake");
   setBacklight(false);
+  setBacklightPower(true);
   lastInteract = millis();
   petSetState(ST_IDLE);
   stateStart = millis();
-  drawPet(F_SLEEP);
-  drawIdleHint();
-  petAnimSet(A_WAKE);  // 睁眼动画结束后自动转 A_IDLE
+  syncKeyStates();
+  curPage = lastPageBeforeVoice;
+  if (curPage == PAGE_CLOCK) {
+    drawClockPage(true);
+  } else if (curPage == PAGE_FOCUS) {
+    drawFocusPage(true);
+  } else {
+    curPage = PAGE_PET;
+    drawPet(F_SLEEP);
+    drawIdleHint();
+    petAnimSet(A_WAKE);  // 睁眼动画结束后自动转 A_IDLE
+  }
 }
 
 void startDizzy() {
   lastInteract = millis();
   petSetState(ST_SHOW);
   stateStart = millis();
-  showUntil = millis() + 3000;
+  showDurMs = 3000;
   drawPet(F_DIZZY);
+  drawBottomBar("天旋地转呜…别摇我啦~", 72, TFT_LIGHTGREY);
   petAnimSet(A_DIZZY);
 }
 
@@ -421,7 +637,10 @@ void handleSense() {
     lastInteract = millis();
     curPage = PAGE_FOCUS;
     lastPageBeforeVoice = PAGE_FOCUS;
+    petSetState(ST_IDLE);
+    stateStart = millis();
     startPomodoro();
+    drawFocusPage(true);  // 先初始化专注看板帧缓冲，防止后续倒计时局部重绘叠在小猫背景上
     setBacklightPower(false);
     beep(880, 40);
     return;
@@ -431,15 +650,16 @@ void handleSense() {
     lastInteract = millis();
     setBacklightPower(true);
     beep(1319, 60);
-    if (state == ST_IDLE) {
-      if (curPage == PAGE_FOCUS) {
-        drawFocusPage(true);
-      } else if (curPage == PAGE_CLOCK) {
-        drawClockPage(true);
-      } else {
-        drawPet(F_NORMAL);
-        drawIdleHint();
-      }
+    petSetState(ST_IDLE);
+    stateStart = millis();
+    if (curPage == PAGE_FOCUS) {
+      drawFocusPage(true);
+    } else if (curPage == PAGE_CLOCK) {
+      drawClockPage(true);
+    } else {
+      drawPet(F_NORMAL);
+      drawIdleHint();
+      petAnimSet(A_IDLE);
     }
     return;
   }
@@ -463,6 +683,32 @@ void handleSense() {
   }
 }
 
+void performSkinToggleWithFeedback() {
+  if (!petSkinHasDs()) {
+    beep(440, 150);
+    drawBubbleText("尚未同步大肥鱼皮肤", TFT_BLACK, "请在电脑运行 sync_qspi_skin.py", TFT_BLACK);
+    delay(1800);
+    enterIdle();
+    return;
+  }
+  petSkinToggle();
+  if (hasActiveConfig) {
+    activeConfig.activeSkin = currentSkinId;
+    wioConfigSave(activeConfig);
+    if (strlen(activeConfig.deepseekKey) > 0) {
+      wioLlmDeepSeekBegin(activeConfig.deepseekKey, getPetSystemPrompt());
+    }
+  }
+  beep(1568, 80);
+  delay(60);
+  beep(1760, 120);
+  drawPet(F_HAPPY);
+  drawBubbleText("换装成功啦~", TFT_BLACK, String("我是") + petSkinGetName() + "!", TFT_BLACK);
+  drawBottomBar(String(petSkinGetName()) + " 准备好啦!", -1, TFT_LIGHTGREY);
+  delay(1500);
+  enterIdle();
+}
+
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
@@ -470,6 +716,7 @@ void setup() {
   tone(WIO_BUZZER, 1200, 60);
 
   for (int i = 0; i < 8; i++) pinMode(ALL_KEYS[i], INPUT_PULLUP);
+  syncKeyStates();
   pinMode(LCD_BACKLIGHT, OUTPUT);
   digitalWrite(LCD_BACKLIGHT, LOW);  // 先保持背光关闭，彻底杜绝开机白屏！
 
@@ -486,12 +733,13 @@ void setup() {
   randomSeed(analogRead(A0) ^ micros());
   wioMicBegin();
   Serial.println("INIT: mic ok");
-  wioMicConfig(400, PET_TRAILING_MS, 8000);  // 静音阈值 / 截断静音时长 / 没说话超时
+  wioMicConfig(400, PET_TRAILING_MS, 4500);  // 静音阈值 / 截断静音时长 / 没说话超时(4.5s)
   wioSenseBegin();
   Serial.println("INIT: sense ok");
   wioConfigInit();
   hasActiveConfig = wioConfigLoad(activeConfig);
   Serial.println("INIT: config ok");
+  petSkinInit(hasActiveConfig ? activeConfig.activeSkin : 0);
   if (!hasActiveConfig) {
 #if HAS_COMPILED_SECRETS
     memset(&activeConfig, 0, sizeof(activeConfig));
@@ -513,18 +761,18 @@ void setup() {
     }
   }
   applyActiveConfig();
-  Serial.println("HELLO pet 1.3");
+  Serial.println("HELLO pet 1.4");
   drawPet(F_SLEEP);
   digitalWrite(LCD_BACKLIGHT, HIGH);  // 首帧就绪后再亮屏，从深黑优雅平滑醒来！
   if (hasActiveConfig && strlen(activeConfig.ssid) > 0) {
-    drawTextCJK("小维醒来中…正在连网", 84, 218, 320, TFT_LIGHTGREY, C_BOTTOM_BG);
+    drawBottomBar(String(petSkinGetName()) + " 醒来中…正在连网", -1, TFT_LIGHTGREY);
     petAnimSet(A_WAKE);
     petNetWarmup();
     if (WiFi.status() == WL_CONNECTED) {
       syncNetworkTime();
     }
   } else {
-    drawTextCJK("初次见面! 按 A 键配网", 80, 218, 320, TFT_LIGHTGREY, C_BOTTOM_BG);
+    drawBottomBar("初次见面! 按 A 键配网", 80, TFT_LIGHTGREY);
     petAnimSet(A_WAKE);
   }
 #if PET_TEST_BAD_TOKEN
@@ -533,24 +781,6 @@ void setup() {
   lastInteract = millis();
   enterIdle();
   Serial.println("!READY");
-}
-
-static int injectedKey = -1;
-
-void petInjectKey(int pin) {
-  injectedKey = pin;
-}
-
-bool pressed(int pin) {
-  if (injectedKey == pin) {
-    injectedKey = -1;
-    return true;
-  }
-  static unsigned long lastMs = 0;
-  if (digitalRead(pin) != LOW) return false;
-  if (millis() - lastMs < 200) return false;
-  lastMs = millis();
-  return true;
 }
 
 uint32_t petFreeRam() {
@@ -637,20 +867,130 @@ void handleTestCommands() {
           drawFeatures(F_NORMAL, lk);
           Serial.print("!OK LOOK ");
           Serial.println(lk);
+#if defined(ARDUINO)
+        } else if (cmdBuf.startsWith("!QSPI_ERASE ")) {
+          int sp = cmdBuf.indexOf(' ', 12);
+          uint32_t addr = strtoul(cmdBuf.substring(12, sp > 0 ? sp : cmdBuf.length()).c_str(), NULL, 16);
+          uint32_t len = (sp > 0) ? strtoul(cmdBuf.substring(sp + 1).c_str(), NULL, 16) : 4096;
+          wioConfigInit();
+          const sfud_flash* flash = sfud_get_device(0);
+          if (flash && sfud_erase(flash, addr, len) == SFUD_SUCCESS) {
+            Serial.print("!OK QSPI_ERASE ");
+            Serial.println(len, HEX);
+          } else {
+            Serial.println("!ERR QSPI_ERASE");
+          }
+        } else if (cmdBuf.startsWith("!QSPI_WRITE ")) {
+          int sp = cmdBuf.indexOf(' ', 12);
+          if (sp < 0) {
+            Serial.println("!ERR QSPI_WRITE_SYNTAX");
+          } else {
+            uint32_t addr = strtoul(cmdBuf.substring(12, sp).c_str(), NULL, 16);
+            String hexStr = cmdBuf.substring(sp + 1);
+            hexStr.trim();
+            size_t byteLen = hexStr.length() / 2;
+            if (byteLen > 0 && byteLen <= 512) {
+              uint8_t buf[512];
+              for (size_t i = 0; i < byteLen; i++) {
+                char h1 = hexStr[i * 2];
+                char h2 = hexStr[i * 2 + 1];
+                auto unhex = [](char c) -> uint8_t {
+                  if (c >= '0' && c <= '9') return c - '0';
+                  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                  return 0;
+                };
+                buf[i] = (unhex(h1) << 4) | unhex(h2);
+              }
+              const sfud_flash* flash = sfud_get_device(0);
+              if (flash && sfud_write(flash, addr, byteLen, buf) == SFUD_SUCCESS) {
+                Serial.print("!OK QSPI_WRITE ");
+                Serial.println(byteLen);
+              } else {
+                Serial.println("!ERR QSPI_WRITE_FAIL");
+              }
+            } else {
+              Serial.println("!ERR QSPI_WRITE_LEN");
+            }
+          }
+        } else if (cmdBuf.startsWith("!QSPI_DIAG")) {
+          Serial.print("!DIAG skinId="); Serial.print(currentSkinId);
+          Serial.print(" hasDs="); Serial.print(hasDsSkin);
+          Serial.print(" hdrMagic="); Serial.print(dsSkinHeader.magic, HEX);
+          Serial.print(" bgOff="); Serial.print(dsSkinHeader.bgOffset);
+          Serial.print(" palOff="); Serial.print(dsSkinHeader.paletteOffset);
+          Serial.print(" face="); Serial.print(dsSkinHeader.faceW); Serial.print("x"); Serial.println(dsSkinHeader.faceH);
+
+          int palZeroCount = 0;
+          for (int i = 0; i < 256; i++) {
+            if (dsPalette[i] == 0) palZeroCount++;
+          }
+          Serial.print("!PAL_ZERO_COUNT="); Serial.println(palZeroCount);
+          Serial.print("!PAL_FIRST8=");
+          for (int i = 0; i < 8; i++) {
+            Serial.print(dsPalette[i], HEX); Serial.print(" ");
+          }
+          Serial.println();
+
+          uint8_t sfReadBuf[16] = {0};
+          uint32_t bgAddr = QSPI_SKIN1_ADDR + dsSkinHeader.bgOffset;
+          petQspiRead(bgAddr, sfReadBuf, 16);
+
+          Serial.print("!BG_READ=");
+          for (int i = 0; i < 16; i++) {
+            if (sfReadBuf[i] < 0x10) Serial.print('0');
+            Serial.print(sfReadBuf[i], HEX);
+          }
+          Serial.println();
+        } else if (cmdBuf.startsWith("!QSPI_READ ")) {
+          int sp = cmdBuf.indexOf(' ', 11);
+          uint32_t addr = strtoul(cmdBuf.substring(11, sp > 0 ? sp : cmdBuf.length()).c_str(), NULL, 16);
+          size_t len = (sp > 0) ? strtoul(cmdBuf.substring(sp + 1).c_str(), NULL, 10) : 16;
+          if (len > 256) len = 256;
+          const sfud_flash* flash = sfud_get_device(0);
+          uint8_t rBuf[256];
+          if (flash && sfud_read(flash, addr, len, rBuf) == SFUD_SUCCESS) {
+            Serial.print("!OK QSPI_READ ");
+            for (size_t i = 0; i < len; i++) {
+              if (rBuf[i] < 0x10) Serial.print('0');
+              Serial.print(rBuf[i], HEX);
+            }
+            Serial.println();
+          } else {
+            Serial.println("!ERR QSPI_READ");
+          }
+        } else if (cmdBuf.startsWith("!QSPI_CHECK ")) {
+          uint32_t addr = strtoul(cmdBuf.substring(12).c_str(), NULL, 16);
+          const sfud_flash* flash = sfud_get_device(0);
+          uint32_t magic = 0;
+          if (flash) sfud_read(flash, addr, 4, (uint8_t*)&magic);
+          Serial.print("!MAGIC ");
+          Serial.println(magic, HEX);
+#endif
+        } else if (cmdBuf.startsWith("!SKIN ")) {
+          int s = cmdBuf.substring(6).toInt();
+          if (petSkinSet(s)) {
+            if (hasActiveConfig) {
+              activeConfig.activeSkin = currentSkinId;
+              wioConfigSave(activeConfig);
+              if (strlen(activeConfig.deepseekKey) > 0) {
+                wioLlmDeepSeekBegin(activeConfig.deepseekKey, getPetSystemPrompt());
+              }
+            }
+            drawPet(F_HAPPY);
+            drawIdleHint();
+            Serial.print("!OK SKIN ");
+            Serial.println(s);
+          } else {
+            Serial.println("!ERR SKIN");
+          }
         }
       }
       cmdBuf = "";
     } else {
-      if (cmdBuf.length() < 64) cmdBuf += c;
+      if (cmdBuf.length() < 1200) cmdBuf += c;
     }
   }
-}
-
-bool anyKeyDown() {
-  for (int i = 0; i < 8; i++) {
-    if (digitalRead(ALL_KEYS[i]) == LOW) return true;
-  }
-  return false;
 }
 
 void loop() {
@@ -661,6 +1001,8 @@ void loop() {
   tickPomodoroLogic();
   if (pomoJustFinished) {
     pomoJustFinished = false;
+    lastInteract = millis();
+    setBacklightPower(true);
     beep(1568, 150);
     delay(150);
     beep(1760, 250);
@@ -668,7 +1010,8 @@ void loop() {
       drawFocusPage(false);
     }
   }
-  if (hasSyncedTime && millis() > nextTimeSyncMs) {
+  // 定期网络对时:仅在 ST_IDLE 待机下触发,且 syncNetworkTime 内部已保证无论成败都推进 nextTimeSyncMs
+  if (state == ST_IDLE && hasSyncedTime && (int32_t)(millis() - nextTimeSyncMs) >= 0) {
     syncNetworkTime();
   }
   switch (state) {
@@ -697,17 +1040,8 @@ void loop() {
       }
 
       if (pressed(PIN_KEY_B)) {  // B 键:全局对讲问答
-        lastInteract = millis();
-        setBacklightPower(true);
         lastPageBeforeVoice = curPage;
-        beep(988, 50);
-        delay(55);  // 等蜂鸣音彻底播完再开麦,杜绝麦克风采集到蜂鸣声造成误触发
-        wioRecStart();
-        petSetState(ST_RECORD);
-        stateStart = millis();
-        drawPet(F_LISTEN);
-        drawBubbleText("在听…说完我会自己停", TFT_BLACK, "也可再按 B 立即发送 / C 取消", TFT_BLACK);
-        petAnimSet(A_LISTEN);
+        startVoiceRecord();
         break;
       }
 
@@ -730,7 +1064,13 @@ void loop() {
           petAnimSet(A_IDLE);
           break;
         }
-        if (pressed(WIO_5S_PRESS) || pressed(WIO_5S_UP) || pressed(WIO_5S_DOWN)) {  // 摸头/互动
+        if (pressed(WIO_5S_PRESS)) {  // 摇杆下压: 换装 / 切换形象
+          lastInteract = millis();
+          Serial.println("K: joy press -> toggle skin!");
+          performSkinToggleWithFeedback();
+          break;
+        }
+        if (pressed(WIO_5S_UP) || pressed(WIO_5S_DOWN)) {  // 摇杆上下: 摸头/互动
           lastInteract = millis();
           beep(1568, 80);
           enterShow(F_HAPPY, "", TFT_BLACK, "", 1200);
@@ -776,26 +1116,38 @@ void loop() {
     case ST_RECORD: {
       uint32_t samples = 0, hint = 0;
 
+      // 跟踪初始按下的 B 键是否已经松开:
+      // - 若用户习惯"按住 B 说话、松开即发"(按住超过 700ms 且已检测到人声后松开)，松手时立即送入思考
+      // - 若是普通点按(<700ms 松开)，则标记 recKeyBReleased=true，后续再按一次 B 才触发手动立即发送
+      if (!recKeyBReleased && digitalRead(PIN_KEY_B) != LOW) {
+        recKeyBReleased = true;
+        if (millis() - stateStart > 700 && wioRecHadSpeech()) {
+          const uint32_t stoppedSamples = wioRecStop();
+          if (stoppedSamples > 1600) {
+            enterThink(stoppedSamples, false);
+            break;
+          }
+        }
+      }
+
       // 1. 按键干预：
-      // - 录音超 200ms 后按 C 键：取消本次录音，快速返回待机
-      // - 录音超 200ms 后按 B 键：提前结束说话，手动立即送入思考
+      // - 按 C 键：取消本次录音，真正关闭 DMA 录音并快速返回待机
+      // - 已松开过 B 键后再按 B 键：提前结束说话，真正停止 DMA 并取实际样本数送入思考
       if (millis() - stateStart > 200) {
         if (pressed(PIN_KEY_C)) {
-          wioRecPoll(samples, hint);  // 关麦清理
+          wioRecStop();  // 真正关闭麦克风 DMA
           beep(440, 60);
           enterIdle();
           break;
         }
-        if (pressed(PIN_KEY_B)) {
-          wioRecPoll(samples, hint);  // 关麦清理
-          recSamples = (samples > 1600) ? samples : 1600;
-          recBufferFull = false;
-          beep(880, 50);
-          petSetState(ST_THINK);
-          stateStart = millis();
-          drawPet(F_THINK);
-          drawBubbleText("让我想想…", TFT_BLACK, "", TFT_BLACK);
-          petAnimSet(A_THINK);
+        if (recKeyBReleased && pressed(PIN_KEY_B)) {
+          const uint32_t stoppedSamples = wioRecStop();
+          if (!wioRecHadSpeech() && stoppedSamples < 3200) {
+            beep(196, 200);
+            enterShow(F_SAD, "你还没说话呢~", TFT_BLACK, "按一下 B 再开口就好", 2500);
+          } else {
+            enterThink((stoppedSamples > 1600) ? stoppedSamples : 1600, false);
+          }
           break;
         }
       }
@@ -803,37 +1155,26 @@ void loop() {
       // 2. 底层 VAD 自动判停
       const int st = wioRecPoll(samples, hint);
       if (st == 2) {  // 超时没说话
+        wioRecStop();
         beep(196, 250);
         enterShow(F_SAD, "你还没说话呢~", TFT_BLACK, "按一下 B 再开口就好", 3000);
         break;
       }
       if (st == 1 || st == 3) {  // 录完: 1=正常说完截断, 3=录满3秒强行截断
-        recSamples = samples;
-        recBufferFull = (st == 3);
-        if (recBufferFull) {
+        wioRecStop();
+        if (st == 3) {
           Serial.println("V: buffer full (hit 3s limit)");
         }
-        beep(880, 50);
-        petSetState(ST_THINK);
-        stateStart = millis();
-        drawPet(F_THINK);
-        drawBubbleText("让我想想…", TFT_BLACK, "", TFT_BLACK);
-        petAnimSet(A_THINK);
+        enterThink(samples, (st == 3));
         break;
       }
 
-      // 3. 硬件/环境硬看门狗：录音最长决不允许超过 4.0 秒，杜绝任何卡死
-      if (millis() - stateStart > 4000) {
-        wioRecPoll(samples, hint);  // 停止底层录音
-        if (samples > 3200) {
-          recSamples = samples;
-          recBufferFull = true;
-          beep(880, 50);
-          petSetState(ST_THINK);
-          stateStart = millis();
-          drawPet(F_THINK);
-          drawBubbleText("让我想想…", TFT_BLACK, "", TFT_BLACK);
-          petAnimSet(A_THINK);
+      // 3. 硬件/环境硬看门狗：录音最长决不允许超过 8.5 秒(4.5s开口等待+2.8s说话+1.2s尾静音)，杜绝任何卡死
+      if (millis() - stateStart > 8500) {
+        const bool hadSpeech = wioRecHadSpeech();
+        const uint32_t stoppedSamples = wioRecStop();
+        if (hadSpeech && stoppedSamples > 3200) {
+          enterThink(stoppedSamples, stoppedSamples >= WIO_MIC_MAX_SAMPLES);
         } else {
           beep(196, 250);
           enterShow(F_SAD, "你还没说话呢~", TFT_BLACK, "按一下 B 再开口就好", 3000);
@@ -844,36 +1185,49 @@ void loop() {
     }
 
     case ST_THINK: {
-      // 识别 + 回答(阻塞数秒;等待期间 petAnimTick 由网络循环驱动)
+      // 识别 + 回答(等待期间 petAnimTick 与取消键检测由 wioNetYield 驱动)
       String t, r, note;
       int emo = EMO_HAPPY;
       const uint32_t tProc = millis();
       const bool ok = petProcessVoice(recSamples, recBufferFull, t, r, emo, note);
       petPrintTiming(millis() - tProc);
+      lastInteract = millis();
       if (ok) {
         beep(1319, 90);
         const int face = (emo >= 0 && emo < 6) ? EMO_FACE[emo] : F_HAPPY;
         String cleanR = "";
-        for (size_t i = 0; i < r.length(); i++) {
+        for (unsigned int i = 0; i < r.length(); i++) {
           char c = r[i];
           if (c != '*' && c != '#' && c != '`') cleanR += c;
         }
         enterShow(face, "你:" + t, 0x8410,
-                  cleanR.length() ? "小维:" + cleanR : String("(还没配置 DeepSeek Key,我不会说话呀)"), 15000);
+                  cleanR.length() ? (String(petSkinGetName()) + ":" + cleanR) : String("(还没配置 DeepSeek Key,我不会说话呀)"), 15000);
+      } else if (thinkUserCancelled) {
+        // 用户按 C 键主动取消思考:直接回待机,不弹错误框
+        beep(440, 60);
+        enterIdle();
       } else {
         beep(196, 250);
         if (note == "asr buffer full") {
-          enterShow(F_CONFUSED, "呜…一句话太长啦~", 0x8410, "单次说话请在3秒内哦", 15000);
+          enterShow(F_CONFUSED, "呜…一句话太长啦~", 0x8410, "单次说话请在3秒内哦", 5000);
+        } else if (thinkWatchdogTimeout) {
+          enterShow(F_SAD, "呜…网络响应超时啦~", 0x8410, "请检查 WiFi 信号后再试", 5000);
         } else {
-          enterShow(F_SAD, "呜…" + friendlyNote(note), 0x8410, note, 15000);
+          enterShow(F_SAD, "呜…" + friendlyNote(note), 0x8410, note, 5000);
         }
       }
       break;
     }
 
     case ST_SHOW: {
-      const bool keyAfterGrace = millis() - stateStart > 400 && anyKeyDown();
-      if (millis() > showUntil || keyAfterGrace) {
+      // 在展示对话结果期间(400ms后)，若直接按 B 键则无缝开启下一轮多轮对话录音!
+      if (millis() - stateStart > 400 && pressed(PIN_KEY_B)) {
+        startVoiceRecord();
+        break;
+      }
+      const bool otherKeyAfterGrace = millis() - stateStart > 400 && (anyKeyDown() || injectedKey != -1);
+      if (millis() - stateStart >= showDurMs || otherKeyAfterGrace) {
+        injectedKey = -1;
         while (anyKeyDown()) petAnimTick();  // 等松手,避免同一次按键在待机里又触发
         enterIdle();
       }
@@ -881,14 +1235,17 @@ void loop() {
     }
 
     case ST_SLEEP: {
-      if (anyKeyDown()) {
+      if (anyKeyDown() || injectedKey != -1) {
+        injectedKey = -1;
         wakeUp();
         while (anyKeyDown()) petAnimTick();  // 等松手,避免叫醒的那一下又触发录音
+        syncKeyStates();
       }
       break;
     }
 
     case ST_CONFIG: {
+      // 退出配网:不在此处同步调阻塞的 WiFi.begin()，确保 <50ms 秒退回 ST_IDLE(下次按 B 说话时 wioNetConnected 自动按需重连)
       if (millis() - stateStart > 300 && (pressed(PIN_KEY_B) || pressed(PIN_KEY_C) || pressed(PIN_KEY_A))) {
         Serial.println("V: exit config by button");
         beep(880, 80);
@@ -907,9 +1264,12 @@ void loop() {
         drawPet(F_HAPPY);
         drawBubbleText("配置保存成功！", TFT_BLACK, "正在重新连网中…", TFT_BLACK);
         petAnimSet(A_EMOTE, F_HAPPY);
-        delay(1200);
+        delay(800);
         applyActiveConfig();
         petNetWarmup();
+        if (WiFi.status() == WL_CONNECTED) {
+          syncNetworkTime();
+        }
         enterIdle();
         break;
       }
@@ -924,4 +1284,3 @@ void loop() {
     }
   }
 }
-

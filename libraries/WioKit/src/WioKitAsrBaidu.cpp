@@ -6,34 +6,51 @@
 #include <rpcWiFiClientSecure.h>
 #include <ArduinoJson.h>
 
-static const char* asrApiKey = nullptr;
-static const char* asrSecretKey = nullptr;
+static String asrApiKey = "";
+static String asrSecretKey = "";
 static String baiduToken = "";
 
 void wioAsrBaiduBegin(const char* apiKey, const char* secretKey) {
-  asrApiKey = apiKey;
-  asrSecretKey = secretKey;
+  const String newKey = apiKey ? apiKey : "";
+  const String newSec = secretKey ? secretKey : "";
+  if (asrApiKey != newKey || asrSecretKey != newSec) {
+    baiduToken = "";  // 密钥内容变更时清空旧缓存令牌(避免同地址覆盖时不更新)
+  }
+  asrApiKey = newKey;
+  asrSecretKey = newSec;
 }
 
-void wioAsrBaiduDebugToken(const char* token) { baiduToken = token; }
-
-// 响应缓冲(预分配,调用方持有):token 响应与 ASR 响应实测都在 1KB 量级,给余量
-static char tokenHttpBuf[2048];
-static char asrHttpBuf[2048];
+void wioAsrBaiduDebugToken(const char* token) { baiduToken = token ? token : ""; }
 
 static bool fetchBaiduToken() {
+  if (wioNetAborted()) return false;
   if (baiduToken.length() > 10) return true;
+  if (asrApiKey.length() < 4 || asrSecretKey.length() < 4) return false;
+
   WiFiClientSecure client;
-  if (!client.connect("openapi.baidu.com", 443, 12000)) return false;
+  if (!client.connect("openapi.baidu.com", 443, 10000)) {
+    client.stop();
+    return false;
+  }
+  if (wioNetAborted()) {
+    client.stop();
+    return false;
+  }
   const String req = String("GET /oauth/2.0/token?grant_type=client_credentials&client_id=") +
                      asrApiKey + "&client_secret=" + asrSecretKey +
                      " HTTP/1.1\r\nHost: openapi.baidu.com\r\nConnection: close\r\n\r\n";
-  client.print(req);
+  if (!wioWriteStr(client, req.c_str(), 6000)) {
+    client.stop();
+    return false;
+  }
   HttpBuf http;
-  http.bind(tokenHttpBuf, sizeof(tokenHttpBuf));
-  if (!wioReadHttp(client, http, 30000, "token")) return false;
+  wioBindSharedHttpBuf(http);
+  if (!wioReadHttp(client, http, 12000, "token")) return false;
+
+  JsonDocument filter;
+  filter["access_token"] = true;
   JsonDocument doc;
-  if (deserializeJson(doc, http.body(), http.len)) return false;
+  if (deserializeJson(doc, http.body(), http.len, DeserializationOption::Filter(filter))) return false;
   baiduToken = String(doc["access_token"] | "");
   return baiduToken.length() > 10;
 }
@@ -42,11 +59,25 @@ bool wioAsrBaiduWarmup() { return fetchBaiduToken(); }
 
 // 上传一次识别请求。返回百度 err_no;传输层失败返回 -1(note 填原因);响应缺 err_no 返回 -2
 static int baiduAsrOnce(const int16_t* pcm, uint32_t n, String& transcript, String& note) {
+  if (wioNetAborted()) {
+    note = "cancelled";
+    return -1;
+  }
+  if (!pcm || n == 0) {
+    note = "asr no speech";
+    return -1;
+  }
   // ASR 走 HTTP 明文(80 端口):板载 TLS 写入只有 ~5KB/s,上传大音频会被服务器掐线;
   // 明文 TCP 快数倍。令牌仍走 HTTPS,音频本身在家庭网络内明文传输(玩具可接受)。
   WiFiClient client;
-  if (!client.connect("vop.baidu.com", 80, 15000)) {
-    note = "asr connect failed";
+  if (!client.connect("vop.baidu.com", 80, 10000)) {
+    client.stop();
+    note = wioNetAborted() ? "cancelled" : "asr connect failed";
+    return -1;
+  }
+  if (wioNetAborted()) {
+    client.stop();
+    note = "cancelled";
     return -1;
   }
   const uint32_t wavLen = 44 + 2 * n;
@@ -61,28 +92,35 @@ static int baiduAsrOnce(const int16_t* pcm, uint32_t n, String& transcript, Stri
                "Connection: close\r\nContent-Length: ";
   req += String(head.length() + b64Len + strlen(tail));
   req += "\r\n\r\n";
-  client.print(req);
-  client.print(head);
-  B64Stream<WiFiClient> b64(client);
+
   const uint32_t upT = millis();
-  // WAV 头 + int16 小端 PCM,必须 flush,否则实际字节数少于 Content-Length,服务器会一直等
+  if (!wioWriteStr(client, req.c_str(), 6000) || !wioWriteStr(client, head.c_str(), 6000)) {
+    client.stop();
+    note = wioNetAborted() ? "cancelled" : "asr upload failed";
+    return -1;
+  }
+  B64Stream<WiFiClient> b64(client);
+  // WAV 头 + int16 小端 PCM,必须经 wioWriteAll 完整发送并 flush,确保实发字节数与 Content-Length 100% 一致
   uint8_t wavHead[44];
   wioMakeWavHeader(wavHead, 2 * n, WIO_MIC_SAMPLE_RATE);
   b64.write(wavHead, 44);
   b64.write((const uint8_t*)pcm, 2 * n);
-  b64.flush();
-  client.print(tail);
+  if (!b64.flush() || !wioWriteStr(client, tail, 6000)) {
+    client.stop();
+    note = wioNetAborted() ? "cancelled" : "asr upload failed";
+    return -1;
+  }
   wioTiming().upload = millis() - upT;
   Serial.print("V: wav uploaded ms=");
   Serial.println(wioTiming().upload);
 
   const uint32_t tAsr = millis();
   HttpBuf http;
-  http.bind(asrHttpBuf, sizeof(asrHttpBuf));
-  const bool ok = wioReadHttp(client, http, 60000, "asr");
+  wioBindSharedHttpBuf(http);
+  const bool ok = wioReadHttp(client, http, 15000, "asr");
   wioTiming().asr = millis() - tAsr;
   if (!ok) {
-    note = "asr http error";
+    note = wioNetAborted() ? "cancelled" : "asr http error";
     return -1;
   }
   JsonDocument adoc;
@@ -102,13 +140,21 @@ static int baiduAsrOnce(const int16_t* pcm, uint32_t n, String& transcript, Stri
 bool wioAsrBaidu(const int16_t* pcm, uint32_t n, String& transcript, String& note) {
   transcript = "";
   note = "";
+  if (wioNetAborted()) {
+    note = "cancelled";
+    return false;
+  }
+  if (asrApiKey.length() < 4 || asrSecretKey.length() < 4) {
+    note = "baidu key missing";
+    return false;
+  }
   const uint32_t tNet = millis();
-  if (!wioNetConnected()) {
-    note = "wifi failed";
+  if (!wioNetConnected(2, 8000)) {
+    note = wioNetAborted() ? "cancelled" : "wifi failed";
     return false;
   }
   if (!fetchBaiduToken()) {
-    note = "baidu token failed";
+    note = wioNetAborted() ? "cancelled" : "baidu token failed";
     return false;
   }
   wioTiming().net = millis() - tNet;
@@ -119,7 +165,7 @@ bool wioAsrBaidu(const int16_t* pcm, uint32_t n, String& transcript, String& not
     Serial.println(errNo);
     baiduToken = "";
     if (!fetchBaiduToken()) {
-      note = "baidu token failed";
+      note = wioNetAborted() ? "cancelled" : "baidu token failed";
       return false;
     }
     errNo = baiduAsrOnce(pcm, n, transcript, note);

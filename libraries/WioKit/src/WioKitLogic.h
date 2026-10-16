@@ -24,8 +24,24 @@ inline long ciFind(const char* h, size_t n, const char* needle) {
 
 inline long httpHeaderEnd(const char* buf, size_t n) { return ciFind(buf, n, "\r\n\r\n"); }
 
+// 提取 HTTP 响应状态码(如 200 / 401 / 402 / 429 / 500);头部不完整或格式非法返回 0
+inline int httpStatusCode(const char* buf, size_t n) {
+  if (!buf || n < 12) return 0;
+  if (memcmp(buf, "HTTP/1.", 7) != 0) return 0;
+  const char* p = buf + 8;
+  while (p < buf + n && *p == ' ') p++;
+  if (p + 3 > buf + n) return 0;
+  if (p[0] < '1' || p[0] > '5' || p[1] < '0' || p[1] > '9' || p[2] < '0' || p[2] > '9') return 0;
+  return (p[0] - '0') * 100 + (p[1] - '0') * 10 + (p[2] - '0');
+}
+
 inline bool httpIsChunked(const char* buf, size_t headerLen) {
-  return ciFind(buf, headerLen, "\ntransfer-encoding:") >= 0 && ciFind(buf, headerLen, "chunked") >= 0;
+  const long te = ciFind(buf, headerLen, "\ntransfer-encoding:");
+  if (te < 0) return false;
+  const size_t start = (size_t)te + 1;
+  const long lineEnd = ciFind(buf + start, headerLen - start, "\r\n");
+  const size_t searchLen = (lineEnd >= 0) ? (size_t)lineEnd : (headerLen - start);
+  return ciFind(buf + start, searchLen, "chunked") >= 0;
 }
 
 // 逐块走一遍 chunked 正文:遇到 0 长度块及其后的 CRLF 才算完整(数据里出现 "0\r\n\r\n" 不会误判)。
@@ -44,7 +60,8 @@ inline bool chunkedWalk(const char* body, size_t n, char* out, size_t* decodedLe
       else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
       else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
       else break;
-      sz = sz * 16 + v;
+      if (sz > (SIZE_MAX >> 4)) return false;  // 防止畸形超大块号整数溢出
+      sz = sz * 16 + (size_t)v;
       any = true;
     }
     if (!any) return false;
@@ -54,7 +71,7 @@ inline bool chunkedWalk(const char* body, size_t n, char* out, size_t* decodedLe
       if (decodedLen) *decodedLen = w;
       return true;
     }
-    if (n - pos < sz + 2) return false;
+    if (sz > n - pos || n - pos - sz < 2) return false;
     if (out) memmove(out + w, body + pos, sz);
     w += sz;
     pos += sz + 2;
@@ -65,11 +82,17 @@ inline bool chunkedWalk(const char* body, size_t n, char* out, size_t* decodedLe
 inline int httpResponseState(const char* buf, size_t n) {
   const long he = httpHeaderEnd(buf, n);
   if (he < 0) return HTTP_NEED_MORE;
+  // 若头部是 HTTP/1.1 100 Continue，则真正响应头还在后面，继续等待
+  if (he >= 12 && memcmp(buf, "HTTP/1.1 100", 12) == 0) {
+    const size_t restStart = (size_t)he + 4;
+    return httpResponseState(buf + restStart, n - restStart);
+  }
   const size_t bodyStart = (size_t)he + 4;
   const size_t bodyLen = n - bodyStart;
   const long cl = ciFind(buf, (size_t)he, "\ncontent-length:");
   if (cl >= 0) {
     const long want = strtol(buf + cl + 16, NULL, 10);  // 数字后面紧跟 \r,strtol 会停下
+    if (want < 0) return HTTP_NO_LENGTH;
     return (long)bodyLen >= want ? HTTP_DONE : HTTP_NEED_MORE;
   }
   if (httpIsChunked(buf, (size_t)he)) {
@@ -168,7 +191,7 @@ struct MotionDetector {
       still = false;
       stillSince = now;
       refX = x; refY = y; refZ = z;
-      if (hits >= 3 && now >= cooldownUntil) {
+      if (hits >= 3 && (cooldownUntil == 0 || (int32_t)(now - cooldownUntil) >= 0)) {
         hits = 0;
         cooldownUntil = now + 8000;
         return MOTION_SHAKE;

@@ -1,28 +1,25 @@
 # HANDOFF — Wio Terminal AI 桌宠「小维」交接文档
 
-> 更新:2026-10-02。给下一个接手的会话/工程师:先读"当前状态"和"下一步",避免重复踩坑。
+> 更新:2026-10-16。给下一个接手的会话/工程师:先读"当前状态"和"下一步",避免重复踩坑。
 
 ## 一句话
 
-Wio Terminal(SAMD51 + 2.4" 彩屏 + WiFi + 板载麦克风)改造成的**离线语音 AI 桌宠「小维」**:
-按一下 B 说话 → 自动截断 → 百度 ASR 转文字 → DeepSeek 回答 → 屏幕以汉字气泡显示。
-主产品是 `pet/`(桌宠),公共能力已沉淀为标准 Arduino 库 `libraries/WioKit/`(2026-10-02 完成)。
+Wio Terminal(SAMD51 + 2.4" 彩屏 + WiFi + 板载麦克风 + 4MB QSPI Flash)改造成的**全功能语音 AI 桌宠「小维 / 大肥鱼」**:
+按一下 B 说话 → 自动截断 → 百度 ASR 转文字 → DeepSeek 多轮回答 → 屏幕以汉字气泡 + 14 种像素表情展示; 支持双主题一键换装、三合一看板(桌宠/赛博时钟/番茄钟)、平扣即专注与手机网页配网。
+主产品是 `pet/`(桌宠),公共能力沉淀为标准 Arduino 库 `libraries/WioKit/`。
 
-## 当前状态(2026-10-04)✅ 视觉像素化重构完成 & 库化就绪
+## 当前状态(2026-10-16)✅ 双主题换肤 + 全链路 32 项深度加固就绪
 
-- **概念图 2 复古像素场景与小猫 100% 还原**:
-  - 原几何色块简陋画风彻底替换为高质量 320x240 复古像素小屋（星空窗户、绿植、木地板、印花坐垫、底色状态栏）。
-  - 小猫形象与 14 种情绪面部（86x32 切片：正常、眨眼、开心、兴奋、难过、听、想、惊讶、害羞、疑惑、犯困、沉睡、眩晕、哈欠）完美贴合概念图。
-  - 架构：256 色全局共享调色板 + 字节索引场景底图 (75KB) + 14 个面部差分切片 (37.6KB)，总资源 113KB Flash，0 静态 RAM。
-  - 性能：面部微小脏矩形局部刷新（SPI 事务 ~1.5ms 极速无闪烁）；气泡与装饰擦除直接根据索引图指针算行恢复，无需整屏重绘或全屏双缓冲。
-  - 固件体积：Flash 430KB / 507KB (84%，余 77KB)，RAM 余量安全（麦克风 96KB DMA 缓冲不受影响）。
-  - 宿主模拟器：`sim/build.bat` 全 12 帧场景跑通，`sim/out/*.png` 视觉验收通过。
-- **WioKit 库已建成**, pet 迁移到库上, 语音全链路代码**编译与真机验证全部通过**
-- **真机验收状态 (2026-10-04 实机通过)**:
-  1. **L0 自检**: `sim/build.bat` 宿主 51 项测试全部 `SELFTEST PASS 51/51`。
-  2. **pet 冒烟**: 自动烧录通过；开机序列 `V: mic init ok`、`S: imu ok`、`V: wifi OK`、`V: warmup ok ms=6334`；光线与 IMU 共享采样正常。
-  3. **视觉与渲染**: 气泡框边缘严实闭合，无多余黑边残影，表情切换微秒级响应且 100% 还原概念图。
-  4. **云端与模型**: 百度语音短语音转写与 DeepSeek 情绪对话链路调通。
+- **双主题动态换肤系统（小维像素猫 ↔ 大肥鱼 DeepSeek 娘）**:
+  - **主题 0（小维）**: 内置在 MCU Flash (`pet/pet_scene_data.h`, 113KB)，320x240 复古像素小屋与 14 种 `86x32` 面部切片。
+  - **主题 1（大肥鱼）**: 打包为 `art/skin_deepseek.bin` (104.5KB) 烧写于板载 **4MB QSPI Flash** (`0x00040000`)，运行时仅常驻 512B 调色板，背景与 14 种 `58x35` 面部切片通过 QSPI 流式按行渲染；搭配定制藏青底色 (`0x2906`) + 海洋蓝 (`0x4478`) 双层圆角底栏 (`drawBottomBar`) 与女仆鲸鱼娘专属 System Prompt。
+  - 在桌宠页下压五向摇杆即可实时切换形象并持久化保存。
+- **全链路 32 项稳定性与底层白盒加固**:
+  - 彻底根治 `ST_THINK` 卡死/假死 6 大根因：8 键独立边沿消抖（兼顾点按自动 VAD 与长按说话松手即发）、`wioRecStop()` 原子关麦与 200ms 滑动预卷防静音误传、`wioWriteAll()` 完整重试流式上传、C 键秒级中断 + 28s 总看门狗、6KB 共享静态 HTTP 缓冲 (`wioBindSharedHttpBuf`)、网页配网留空保留原密码与 HTML 转义。
+  - 扩展二级高频汉字库 (`tools/gen_font.py`) 与 UTF-8 零宽/Emoji 变体选择符静默过滤 (`WioKitCjk.cpp`)。
+- **真机与模拟器验收状态 (2026-10-16 实机通过)**:
+  1. **L0 自检**: `sim/build.bat` 宿主 60 项测试全部 `SELFTEST PASS 60/60`，12 帧全场景 PNG 渲染通过。
+  2. **真机编译与烧录**: Flash ~486KB / 507KB (95%)，双皮肤切换、底栏外框渲染、配网、时钟、番茄钟、语音对答全链路实机验证通过。
 
 ## 硬件与账号
 
@@ -58,26 +55,29 @@ bash tools/flash_and_log.sh console 600                 # 菜单版控制台
 
 ```
 libraries/WioKit/            标准 Arduino 库(library.properties + src/ + examples/)
-  src/WioKitLogic.h          L0 纯逻辑:HTTP 判停/chunked/情绪标签/光线动作探测器
-                             (无 Arduino 依赖;唯一有自动化测试的层,tests/pet_selftest)
+  src/WioKitLogic.h          L0 纯逻辑:HTTP 判停/状态码/chunked/情绪标签/光线动作探测器
+                             (无 Arduino 依赖;tests/pet_selftest 60 项测试全覆盖)
   src/WioKitCjk.h/.cpp       L1 中文渲染:UTF-8→GB2312→HZK16,行缓冲 + pushImage 批量推送
   src/WioKitFontHz16.h       字库数据(~150KB Flash;由 tools/gen_font.py 生成,勿手改)
-  src/WioKitMic.h/.cpp       L1 录音:DMA 16bit 16kHz + 高通 + VAD 截断 + 静音裁剪
+  src/WioKitMic.h/.cpp       L1 录音:DMA 16bit 16kHz + 高通 + 滑动预卷 VAD + 原子停止 + 静音裁剪
                              (96KB PCM 静态数组,wioRecBuffer() 零拷贝暴露)
-  src/WioKitNet.h            L1 网络(header-only 模板):WiFi 连接/HTTP 收发/b64 流式/
-                             WAV 头;HttpBuf 预分配收响应;等待循环走 wioNetYield()
-  src/WioKitSense.h/.cpp     L1 传感器:光线(ADC1 共享读法,踩坑成果勿改 analogRead)+ LIS3DH
-  src/WioKitAsrBaidu.h/.cpp  L2 百度 ASR:token 缓存/失效重取,WAV,明文 80 端口上传
-  src/WioKitLlmDeepSeek.h/.cpp L2 DeepSeek chat
+  src/WioKitNet.h            L1 网络(header-only 模板):WiFi 连接/共享 6KB HttpBuf/wioWriteAll/
+                             b64 流式/WAV 头/wioNetSetAbort 中断;等待循环走 wioNetYield()
+  src/WioKitSense.h/.cpp     L1 传感器:光线(ADC1 共享读法,勿改 analogRead)+ LIS3DH 摇晃/拿起/平扣
+  src/WioKitConfig.h/.cpp    L1 配网与存储:4MB QSPI Flash 持久化 + SoftAP Captive Portal 网页配网
+  src/WioKitAsrBaidu.h/.cpp  L2 百度 ASR:token 缓存/失效重取,WAV,明文 80 端口流式上传
+  src/WioKitLlmDeepSeek.h/.cpp L2 DeepSeek 多轮对话客户端
   src/WioKitTiming.h         计时账本(wioTiming(),"T:" 行数据源)
-pet/                         应用层只剩:状态机、pet_face/pet_anim(表情动画)、
-                             系统提示词、密钥(__has_include 门控)、语音编排 petProcessVoice()
+pet/                         应用层:状态机(pet.ino)、表情渲染(pet_face.h)、动画(pet_anim.h)、
+                             时钟与番茄钟看板(pet_pages.h)、双皮肤管理(pet_skin_manager.h/.cpp)
+art/skin_deepseek.bin        DeepSeek 娘「大肥鱼」QSPI 皮肤二进制包(烧写至 QSPI 0x00040000)
 sim/                         宿主模拟器(Windows/MSVC):真实 pet.ino/pet_face/pet_anim/WioKitCjk
                              编译成 PC 程序,屏幕出 PNG、按键脚本注入、云端走仿真桩。
-                             bash sim/build.sh 跑场景 + L0 自检;README 首图即出自这里
-console/                     不迁,拷贝保留原状
-tests/pet_selftest/          L0 板上自检(直接 include 库头,不再有同步拷贝)
-tools/gen_font.py            字体生成器 → 直接吐到 libraries/WioKit/src/WioKitFontHz16.h
+                             sim/build.bat 跑场景 + L0 自检(60/60)
+console/                     菜单版桌面控制台
+tests/pet_selftest/          L0 板上/宿主自检(60 项断言)
+tools/                       gen_font.py(字库生成)、build_pixel_pet.py(小猫素材)、
+                             build_deepseek_pet.py / pack_qspi_skin.py / sync_qspi_skin.py(大肥鱼皮肤管线)
 ```
 
 **三个解耦点**(改代码时别绕回去):

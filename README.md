@@ -18,24 +18,27 @@
 
 | 动作 | 反应 |
 |------|------|
-| 按一下 B | 全局对讲: 开始听,说完自动发送(1.2s 静音自动截断,最长 3s,支持多轮对答) |
+| 按一下 B (或长按 B) | 全局对讲: 点按自动 VAD 截断(1.2s 静音自动发送,最长 3s)或长按说话松手即发; 思考中按 C 随时取消 |
 | 按一下 A | 进入**端侧配网模式**(手机连热点 `Wio-Pet`,网页直接配 WiFi、城市与密钥) |
 | 摇杆左 / 右 | **三合一多功能看板切换** (像素桌宠房间 ↔ 75px 赛博时钟 ↔ 25分钟番茄钟) |
-| 摇杆下压 / 上 / 下 | 桌宠页摸头互动; 时钟页网络对时; 番茄钟页启停计时 |
+| 摇杆下压 | 桌宠页**一键切换宠物形象**(小猫「小维」↔ DeepSeek 娘「大肥鱼」); 时钟页网络对时; 番茄钟页启停计时 |
+| 摇杆上 / 下 | 桌宠页摸头互动 |
 | 桌面平扣 (Flip-to-Focus) | 屏幕自动熄灭进入 25 分钟专注番茄钟; 翻起自动亮屏恢复显示 |
 | 摇晃 | 晕 3 秒(蚊香眼),之后冷却 5 秒 |
 | 拿起 | 从犯困里打起精神 |
 | 3 分钟没人理 / 5 分钟 | 犯困(打哈欠)/ 睡觉(Zzz) |
 | 任意按键 | 睡醒 |
 
+- **双主题动态换肤（「小维」像素猫 ↔ 「大肥鱼」DeepSeek 娘）**:
+  - 桌宠页下压五向摇杆即可实时换装，自动切换角色视觉、底栏定制双层圆角高光框与专属 AI 人设 System Prompt（元气小猫「小维」 vs 傲娇偷吃算力的女仆鲸鱼娘「大肥鱼」），偏好持久保存在 QSPI Flash 中。
 - **三合一桌面多功能看板**:
-  - **看板 0（像素桌宠）**: 概念图 100% 还原的复古像素小屋、小猫实时待机动画、摸头互动与 AI 对话。
+  - **看板 0（像素桌宠）**: 概念图 100% 还原的复古像素小屋、实时待机动画、摸头互动、换装与 AI 语音对话。
   - **看板 1（赛博时钟）**: 75 像素巨大数码管粗体（Font 8，宽 250px），两米外清晰可读；零闪烁局部直写机制 + 3px 平滑线性秒数进度条，彻底杜绝刷屏与背光频闪；支持 HTTP 自动对齐精确北京时间。
-  - **看板 2（25 分钟番茄钟）**: 75 像素大倒计时，专注计时结束自动蜂鸣提示。
+  - **看板 2（25 分钟番茄钟）**: 75 像素大倒计时，专注计时结束自动蜂鸣提示并动态刷新今日专注次数。
 - **扣下即专注 (Flip-to-Focus)**: 基于板载 LIS3DHTR 三轴加速度计精密重力标定。将设备正面扣在桌面上自动关闭 LCD 背光并启动番茄钟；翻起即刻亮屏恢复，省电且免打扰。
 - **端侧独立配网与持久化**: 随时按顶部 **A 键** 进入配网模式，Wio Terminal 开启 `Wio-Pet` 热点与 Captive Portal 网页。手机直连访问 `192.168.4.1` 图形化选择 WiFi、设置城市与 API 密钥。配置永久存储在板载 **4MB QSPI Flash**（W25Q32JV）中，平时运行 0 额外 RAM 占用。
-- **连续多轮对答与上下文**: 自动记忆最近 2 轮问答历史（超过 90 秒无互动自动重置），长句停顿容忍放宽至 1.2s，单句录满 3 秒时友好引导。
-- **回答与像素动画**: 回答以情绪标签(`[开心]` `[兴奋]` `[惊讶]` `[害羞]` `[疑惑]` `[难过]`)开头,由系统提示词约定、DeepSeek 生成;标签驱动 14 种高精度像素表情,正文以气泡上屏。录音为 16bit@16kHz DMA 采样 + 高通滤波,上传前做首尾静音裁剪。
+- **连续多轮对答与高可靠语音链路**: 自动记忆最近 2 轮问答历史（超过 90 秒无互动自动重置）；具备滑动预卷人声检测、首尾 100ms 余量静音裁剪、百度 ASR 识别结果即时上屏预览、C 键秒级中断与 28 秒硬件看门狗兜底。
+- **回答与像素动画**: 回答以情绪标签(`[开心]` `[兴奋]` `[惊讶]` `[害羞]` `[疑惑]` `[难过]`)开头,由系统提示词约定、DeepSeek 生成;标签驱动 14 种高精度像素表情,正文以气泡上屏。录音为 16bit@16kHz DMA 采样 + 高通滤波。
 
 ## 3D 打印外壳:复古桌面显示器
 
@@ -96,20 +99,23 @@
 
 > 参考价为淘宝 / 拼多多常见价位的估计,以实际购买为准。
 
-## 像素美术与资源架构
+## 像素美术与双皮肤资源架构
 
-- **概念图 100% 还原**: 320x240 复古像素小屋（星空窗口、绿植花盆、木质条纹地板、几何印花坐垫、底部状态框）。
+- **双皮肤架构（片内 Flash + 片外 4MB QSPI Flash 流式直驱）**:
+  - **主题 0 — 小维（复古像素小猫）**: 内置在 MCU Flash (`pet/pet_scene_data.h`)，320x240 复古像素小屋 + 14 种 `86x32` 面部表情切片，约 113 KB Flash。
+  - **主题 1 — 大肥鱼（DeepSeek 女仆鲸鱼娘）**: 打包为 `art/skin_deepseek.bin` (~104.5 KB) 存储在板载 **4MB QSPI Flash** (`0x00040000`)，运行时仅常驻 512 字节 RGB565 调色板，背景与 14 组 `58x35` 面部切片均通过 QSPI 按行流式直推屏幕，搭配专属藏青底色 (`0x2906`) 与海洋蓝 (`0x4478`) 双层圆角底栏外框。
 - **14 种情绪像素面部**: 正常、眨眼、开心、兴奋、难过、听、想、惊、害羞、疑惑、犯困、沉睡、眩晕、打哈欠。
-- **低内存高帧率架构**:
+- **低内存高帧率渲染**:
   - 256 色全局共享调色板 (512 字节 RGB565)
-  - 320x240 字节索引背景图 (75.0 KB)
-  - 14 个面部差分切片 (37.6 KB, 86x32)
-  - **Flash 占用约 113 KB，RAM 堆零占用**（仅使用 640 字节栈上行缓冲，为麦克风 96KB DMA 缓冲区留足裕量）。
-- **极速局部刷新**: 面部微表情切换只刷新 `86x32` 脏矩形，SPI 传输仅需 **~1.5ms**，完全零闪烁；气泡与装饰擦除根据索引数组指针按行恢复，无需整屏重绘。
-- **资源管线**:
+  - 320x240 字节索引背景图 (75.0 KB) + 14 个面部差分切片
+  - **RAM 堆零占用**（仅使用 640 字节栈上行缓冲，为麦克风 96KB DMA 缓冲区留足裕量）。
+- **极速局部刷新**: 面部微表情切换只刷新脏矩形，SPI 传输仅需 **~1.5ms**，完全零闪烁；气泡与装饰擦除根据索引数组或 QSPI 偏移按行恢复，无需整屏重绘。
+- **资源管线与皮肤工具**:
   - `art/src/concept_pixel_art.jpg` (原始概念艺术图)
-  - `tools/build_pixel_pet.py` (眼窝深度净空与 14 种像素表情生成)
-  - `tools/export_pet_assets.py` (复合调色板量化并导出 `pet/pet_scene_data.h`)
+  - `tools/build_pixel_pet.py` / `tools/export_pet_assets.py` (小猫主题表情生成与导出)
+  - `tools/build_deepseek_pet.py` / `tools/pack_qspi_skin.py` (DeepSeek 娘皮肤生成与二进制打包 `art/skin_deepseek.bin`)
+  - `tools/sync_qspi_skin.py` (通过串口将 `skin_deepseek.bin` 烧写并校验至板载 QSPI Flash)
+  - `tools/switch_skin.py` (编译期/命令行皮肤切换工具)
 
 ## 快速上手
 
@@ -118,8 +124,8 @@
 1. 安装 [arduino-cli](https://arduino.github.io/arduino-cli/)、板卡包
    `Seeeduino:samd`(板卡源 `https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json`)
    及依赖库:`Seeed_GFX2`、`Seeed Arduino rpcWiFi`、`ArduinoJson`、`Seeed Arduino Mic`、
-   `Grove-3-Axis-Digital-Accelerometer-2g-to-16g-LIS3DHTR`
-2. 配密钥:`cp pet/wifi_secrets.h.example pet/wifi_secrets.h`,填 WiFi、百度语音 Key、DeepSeek Key
+   `Grove-3-Axis-Digital-Accelerometer-2g-to-16g-LIS3DHTR`、`Seeed Arduino SFUD`
+2. 配密钥:可按顶部 **A 键** 进入 `Wio-Pet` 手机网页热点配网，或 `cp pet/wifi_secrets.h.example pet/wifi_secrets.h` 填入默认 WiFi、百度语音 Key、DeepSeek Key
    (该文件已被 gitignore;不填则得到一只"离线宠物"——动画表情照常,说话会提示没网)
 3. 编译烧录(一键脚本,Windows/Git Bash,自动按 VID 找串口 + 挂串口日志;其他平台用下面的手动命令):
 
@@ -132,7 +138,12 @@
    arduino-cli upload  -p <PORT> --fqbn Seeeduino:samd:seeed_wio_terminal --libraries libraries
    ```
 
-4. 按 B,跟它说句话。
+   *(可选) 首次烧写 DeepSeek 娘扩展皮肤包至 QSPI Flash:*
+   ```bash
+   python tools/sync_qspi_skin.py -p <PORT>
+   ```
+
+4. 按 B 跟它说话；在桌宠页下压摇杆切换「小维」与「大肥鱼」主题。
 
 ## WioKit —— 它脚下的库
 
@@ -141,13 +152,14 @@ pet 的全部硬件能力沉淀在 [libraries/WioKit/](libraries/WioKit/)(标准
 
 | 层 | 模块 | 内容 |
 |----|------|------|
-| L0 | `WioKitLogic.h` | 纯逻辑(无 Arduino 依赖):HTTP 判停 / chunked 解码 / 情绪标签 / 光线动作探测器,板上自检覆盖 |
-| L1 | `WioKitCjk` | 中文渲染:UTF-8→GB2312→HZK16,行缓冲 + pushImage 批量推送 |
-| L1 | `WioKitMic` | DMA 录音 + VAD 自动截断 + 静音裁剪(96KB PCM 零拷贝暴露) |
-| L1 | `WioKitNet` | WiFi 连接 / HTTP 收发(预分配 HttpBuf)/ base64 流式上传 / 等待期 yield 回调 |
-| L1 | `WioKitSense` | 光线(与麦克风共用 ADC1 的共享读法)+ LIS3DH 摇晃/拿起 |
-| L2 | `WioKitAsrBaidu` | 百度 ASR:token 缓存与失效重取、WAV 封装、明文 80 端口上传 |
-| L2 | `WioKitLlmDeepSeek` | DeepSeek chat 客户端 |
+| L0 | `WioKitLogic.h` | 纯逻辑(无 Arduino 依赖):HTTP 判停与状态码提取 / chunked 解码 / 情绪标签 / 光线动作探测器,60 项自检全覆盖 |
+| L1 | `WioKitCjk` | 中文渲染:UTF-8→GB2312→HZK16(含扩展字库与 Emoji 变体过滤),行缓冲 + pushImage 批量推送 |
+| L1 | `WioKitMic` | DMA 录音 + 滑动预卷 VAD 自动截断 + 原子停止 + 静音裁剪(96KB PCM 零拷贝暴露) |
+| L1 | `WioKitNet` | WiFi 连接 / 共享 6KB 静态 HttpBuf / 完整重试流式上传 (`wioWriteAll`) / C 键秒级中断与 yield 回调 |
+| L1 | `WioKitSense` | 光线(与麦克风共用 ADC1 的安全共享读法)+ LIS3DH 摇晃/拿起/平扣检测 |
+| L1 | `WioKitConfig` | 板载 4MB QSPI Flash 持久化存储 + SoftAP Captive Portal 手机网页配网 |
+| L2 | `WioKitAsrBaidu` | 百度 ASR:OAuth token 缓存与失效重取、WAV 封装、明文 80 端口流式上传 |
+| L2 | `WioKitLlmDeepSeek` | DeepSeek 多轮对话客户端 + 401/402/429 精细状态码诊断 |
 
 模块独立 include,不用的不进固件(纯渲染示例固件比 pet 小 40KB+)。独立示例:
 `examples/CjkHello`(只画中文)、`examples/VoiceEcho`(录音→识别→回答全链路)。

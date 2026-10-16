@@ -5,24 +5,35 @@
 #include <rpcWiFiClientSecure.h>
 #include <ArduinoJson.h>
 
-static const char* llmKey = nullptr;
-static const char* llmSystemPrompt = nullptr;
-
-// 响应缓冲(预分配,调用方持有):LLM 回答 JSON 实测 1KB 量级,给余量
-static char llmHttpBuf[4096];
+static String llmKey = "";
+static String llmSystemPrompt = "";
 
 void wioLlmDeepSeekBegin(const char* key, const char* systemPrompt) {
-  llmKey = key;
-  llmSystemPrompt = systemPrompt;
+  llmKey = key ? key : "";
+  llmSystemPrompt = systemPrompt ? systemPrompt : "";
 }
 
 bool wioLlmAskWithHistory(const WioLlmMsg* history, size_t historyCount, const String& question, String& reply, String& note) {
   reply = "";
   note = "";
+  if (wioNetAborted()) {
+    note = "cancelled";
+    return false;
+  }
+  if (llmKey.length() < 5) {
+    note = "llm key missing";
+    return false;
+  }
   const uint32_t tConn = millis();
   WiFiClientSecure client;
-  if (!client.connect("api.deepseek.com", 443, 20000)) {
-    note = "llm connect failed";
+  if (!client.connect("api.deepseek.com", 443, 12000)) {
+    client.stop();
+    note = wioNetAborted() ? "cancelled" : "llm connect failed";
+    return false;
+  }
+  if (wioNetAborted()) {
+    client.stop();
+    note = "cancelled";
     return false;
   }
   wioTiming().llmConn = millis() - tConn;
@@ -32,7 +43,7 @@ bool wioLlmAskWithHistory(const WioLlmMsg* history, size_t historyCount, const S
   JsonArray msgs = req["messages"].to<JsonArray>();
   JsonObject sys = msgs.add<JsonObject>();
   sys["role"] = "system";
-  sys["content"] = llmSystemPrompt;
+  sys["content"] = llmSystemPrompt.length() ? llmSystemPrompt.c_str() : "你是语音助手,用简体中文简短回答。";
 
   // 注入历史对话上下文
   if (history && historyCount > 0) {
@@ -61,14 +72,30 @@ bool wioLlmAskWithHistory(const WioLlmMsg* history, size_t historyCount, const S
   reqStr += String(body.length());
   reqStr += "\r\n\r\n";
   reqStr += body;
-  client.print(reqStr);
+  if (!wioWriteStr(client, reqStr.c_str(), 8000)) {
+    client.stop();
+    note = wioNetAborted() ? "cancelled" : "llm write failed";
+    return false;
+  }
 
   HttpBuf http;
-  http.bind(llmHttpBuf, sizeof(llmHttpBuf));
-  const bool ok = wioReadHttp(client, http, 30000, "llm");
+  wioBindSharedHttpBuf(http);
+  const bool ok = wioReadHttp(client, http, 18000, "llm");
   wioTiming().llm = millis() - tLlm;
   if (!ok) {
-    note = "llm http error";
+    if (wioNetAborted()) {
+      note = "cancelled";
+    } else if (http.status == 401) {
+      note = "llm auth 401";
+    } else if (http.status == 402) {
+      note = "llm balance 402";
+    } else if (http.status == 429) {
+      note = "llm rate 429";
+    } else if (http.status >= 500) {
+      note = String("llm server ") + String(http.status);
+    } else {
+      note = "llm http error";
+    }
     return false;
   }
   JsonDocument ldoc;
